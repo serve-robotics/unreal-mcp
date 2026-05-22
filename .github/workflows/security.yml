@@ -1,0 +1,37 @@
+name: Security Checks
+permissions:
+  contents: read           # needed by actions/checkout
+  actions: read            # lets the action query the workflow run
+  security-events: write   # needed to upload SARIF
+  pull-requests: read      # needed by email-validation to access PR info via GraphQL
+
+on: [push, pull_request, workflow_dispatch]
+concurrency:
+  # Cancel only within same event type to prevent duplicate pushes/PR updates
+  # Push and PR runs can both complete without cancelling each other
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  email:
+    name: Email Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: serve-robotics/actions/security/email-validation@v7
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  semgrep:
+    name: Semgrep Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: serve-robotics/actions/security/semgrep@v7
+
+  trivy:
+    name: Trivy Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: serve-robotics/actions/security/trivy@v7
