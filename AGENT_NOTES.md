@@ -7,7 +7,11 @@ Agents can connect and drive the editor programmatically without human interacti
 
 ---
 
-## Protocol
+## Transports
+
+### TCP Bridge (default)
+Always active. Connect to `127.0.0.1:55557`. Send a newline-terminated JSON request,
+read a newline-terminated JSON response, then close the connection.
 
 ```json
 // Request
@@ -18,7 +22,43 @@ Agents can connect and drive the editor programmatically without human interacti
 {"status": "error",   "error":  "..."}
 ```
 
-Messages are newline-terminated. Connection is persistent.
+### CLI Bridge — MCP stdio transport (opt-in)
+Launch the editor with `-MCPStdio` to activate a second transport that speaks
+**MCP JSON-RPC 2.0 over stdin/stdout**. This lets Claude Code or Claude Desktop
+add the editor directly as an MCP server — no TCP port configuration needed.
+
+Add to your `.mcp.json`:
+```json
+{
+  "mcpServers": {
+    "unreal": {
+      "command": "/path/to/UnrealEditor",
+      "args": [
+        "/path/to/YourProject.uproject",
+        "-MCPStdio",
+        "-nullrhi",
+        "-nosplash"
+      ]
+    }
+  }
+}
+```
+
+Wire format (stdin → editor):
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"spawn_actor","arguments":{"type":"StaticMeshActor","name":"Box","x":"0","y":"0","z":"100"}}}
+```
+
+Wire format (editor → stdout):
+```json
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"status\":\"success\",\"result\":{...}}"}]}}
+```
+
+Both transports share the same command dispatcher and tool set.
+
+---
+
+## Protocol (TCP)
 
 ---
 

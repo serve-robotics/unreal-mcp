@@ -57,6 +57,8 @@
 #include "Commands/UnrealMCPProjectCommands.h"
 #include "Commands/UnrealMCPCommonUtils.h"
 #include "Commands/UnrealMCPUMGCommands.h"
+#include "UnrealMCPCLIBridge.h"
+#include "Misc/CommandLine.h"
 
 // Default settings
 #define MCP_SERVER_HOST "127.0.0.1"
@@ -92,14 +94,29 @@ void UUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
     Port = MCP_SERVER_PORT;
     FIPv4Address::Parse(MCP_SERVER_HOST, ServerAddress);
 
-    // Start the server automatically
+    // Start the TCP server
     StartServer();
+
+    // If -MCPStdio is present on the command line, also start the stdio transport.
+    // This lets Claude Code / Claude Desktop spawn the editor as an MCP server
+    // without any TCP port configuration.
+    if (FParse::Param(FCommandLine::Get(), TEXT("MCPStdio")))
+    {
+        UE_LOG(LogTemp, Display, TEXT("UnrealMCPBridge: -MCPStdio detected — starting CLI bridge"));
+        CLIBridge = MakeUnique<FUnrealMCPCLIBridge>(this);
+        CLIBridge->Start();
+    }
 }
 
 // Clean up resources when subsystem is destroyed
 void UUnrealMCPBridge::Deinitialize()
 {
     UE_LOG(LogTemp, Display, TEXT("UnrealMCPBridge: Shutting down"));
+    if (CLIBridge.IsValid())
+    {
+        CLIBridge->Stop();
+        CLIBridge.Reset();
+    }
     StopServer();
 }
 
@@ -140,8 +157,8 @@ void UUnrealMCPBridge::StartServer()
         return;
     }
 
-    // Start listening
-    if (!NewListenerSocket->Listen(5))
+    // Start listening — backlog of 16 gives headroom while a slow command executes.
+    if (!NewListenerSocket->Listen(16))
     {
         UE_LOG(LogTemp, Error, TEXT("UnrealMCPBridge: Failed to start listening"));
         return;
@@ -329,5 +346,24 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         Promise.SetValue(ResultString);
     });
     
-    return Future.Get();
+    // Poll instead of blocking indefinitely so a disconnected client's
+    // CLOSE-WAIT socket eventually resolves (ServeClient unblocks when we return).
+    constexpr float PollSec  = 0.05f;
+    constexpr float LimitSec = 300.f;
+    for (float Elapsed = 0.f; Elapsed < LimitSec; Elapsed += PollSec)
+    {
+        if (Future.IsReady())
+        {
+            return Future.Get();
+        }
+        FPlatformProcess::Sleep(PollSec);
+    }
+
+    TSharedPtr<FJsonObject> Timeout = MakeShared<FJsonObject>();
+    Timeout->SetStringField(TEXT("status"), TEXT("error"));
+    Timeout->SetStringField(TEXT("error"), TEXT("Game thread did not respond within 300 s"));
+    FString Out;
+    TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+    FJsonSerializer::Serialize(Timeout.ToSharedRef(), W);
+    return Out;
 }

@@ -16,6 +16,7 @@
 #include "UnrealMCPBridge.generated.h"
 
 class FMCPServerRunnable;
+class FUnrealMCPCLIBridge;
 
 /**
  * Editor subsystem for MCP Bridge
@@ -61,4 +62,7 @@ private:
 	TSharedPtr<FUnrealMCPBlueprintNodeCommands> BlueprintNodeCommands;
 	TSharedPtr<FUnrealMCPProjectCommands> ProjectCommands;
 	TSharedPtr<FUnrealMCPUMGCommands> UMGCommands;
-}; 
+
+	// stdio MCP transport — started when -MCPStdio is on the command line
+	TUniquePtr<FUnrealMCPCLIBridge> CLIBridge;
+};

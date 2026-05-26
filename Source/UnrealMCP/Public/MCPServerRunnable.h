@@ -3,12 +3,17 @@
 #include "CoreMinimal.h"
 #include "HAL/Runnable.h"
 #include "Sockets.h"
-#include "Interfaces/IPv4/IPv4Address.h"
 
 class UUnrealMCPBridge;
 
 /**
- * Runnable class for the MCP server thread
+ * Accept loop for the MCP TCP bridge.
+ *
+ * Run() accepts incoming connections and immediately offloads each one to a
+ * dedicated thread (Async/Thread) so the accept loop is never blocked by a
+ * long-running command (e.g. a Python script that saves many assets).
+ * Multiple clients can therefore connect and queue commands concurrently;
+ * they are serialised only at the game-thread execution step.
  */
 class FMCPServerRunnable : public FRunnable
 {
@@ -22,13 +27,16 @@ public:
 	virtual void Stop() override;
 	virtual void Exit() override;
 
-protected:
-	void HandleClientConnection(TSharedPtr<FSocket> ClientSocket);
+private:
+	// Serves one accepted client connection on the calling thread.
+	// Owns the socket lifetime via the shared ptr; exits when the client
+	// disconnects or bRunning becomes false.
+	void ServeClient(TSharedPtr<FSocket> Client);
+
+	// Parses and dispatches a single complete (newline-stripped) JSON message.
 	void ProcessMessage(TSharedPtr<FSocket> Client, const FString& Message);
 
-private:
 	UUnrealMCPBridge* Bridge;
 	TSharedPtr<FSocket> ListenerSocket;
-	TSharedPtr<FSocket> ClientSocket;
 	bool bRunning;
-}; 
+};
