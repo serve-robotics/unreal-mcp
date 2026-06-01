@@ -7,6 +7,8 @@
 #include "Serialization/JsonReader.h"
 #include "Async/Async.h"
 
+DEFINE_LOG_CATEGORY_STATIC(LogMCPServer, Log, All);
+
 static const int32 GRecvBufBytes = 65536; // 64 KB per client
 
 // ---------------------------------------------------------------------------
@@ -45,7 +47,7 @@ void FMCPServerRunnable::Exit()
 
 uint32 FMCPServerRunnable::Run()
 {
-    UE_LOG(LogTemp, Display, TEXT("MCPServer: accept loop started on port 55557"));
+    UE_LOG(LogMCPServer, Display, TEXT("MCPServer: accept loop started on port 55557"));
 
     while (bRunning)
     {
@@ -55,6 +57,11 @@ uint32 FMCPServerRunnable::Run()
             FSocket* RawClient = ListenerSocket->Accept(TEXT("MCPClient"));
             if (RawClient)
             {
+                // Log the remote address so we can confirm connections in the output log.
+                TSharedRef<FInternetAddr> PeerAddr = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->CreateInternetAddr();
+                RawClient->GetPeerAddress(*PeerAddr);
+                UE_LOG(LogMCPServer, Log, TEXT("MCPServer: accepted connection from %s"), *PeerAddr->ToString(true));
+
                 // Wrap with a deleter that calls DestroySocket instead of delete,
                 // so the fd is properly closed when the shared ptr drops to zero.
                 TSharedPtr<FSocket> Client(RawClient, [](FSocket* S)
@@ -74,14 +81,14 @@ uint32 FMCPServerRunnable::Run()
             }
             else
             {
-                UE_LOG(LogTemp, Warning, TEXT("MCPServer: Accept() returned null"));
+                UE_LOG(LogMCPServer, Warning, TEXT("MCPServer: Accept() returned null"));
             }
         }
 
         FPlatformProcess::Sleep(0.05f);
     }
 
-    UE_LOG(LogTemp, Display, TEXT("MCPServer: accept loop stopped"));
+    UE_LOG(LogMCPServer, Display, TEXT("MCPServer: accept loop stopped"));
     return 0;
 }
 
@@ -138,16 +145,18 @@ void FMCPServerRunnable::ProcessMessage(TSharedPtr<FSocket> Client, const FStrin
     TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Message);
     if (!FJsonSerializer::Deserialize(Reader, JsonMsg) || !JsonMsg.IsValid())
     {
-        UE_LOG(LogTemp, Warning, TEXT("MCPServer: invalid JSON (%.200s)"), *Message);
+        UE_LOG(LogMCPServer, Warning, TEXT("MCPServer: invalid JSON (%.200s)"), *Message);
         return;
     }
 
     FString CommandType;
     if (!JsonMsg->TryGetStringField(TEXT("type"), CommandType))
     {
-        UE_LOG(LogTemp, Warning, TEXT("MCPServer: message missing 'type' field"));
+        UE_LOG(LogMCPServer, Warning, TEXT("MCPServer: message missing 'type' field — raw: %.200s"), *Message);
         return;
     }
+
+    UE_LOG(LogMCPServer, Log, TEXT("MCPServer: >> %s"), *CommandType);
 
     // Params are optional — use an empty object if absent.
     TSharedPtr<FJsonObject> Params = MakeShared<FJsonObject>();
@@ -165,6 +174,10 @@ void FMCPServerRunnable::ProcessMessage(TSharedPtr<FSocket> Client, const FStrin
     int32 BytesSent = 0;
     if (!Client->Send(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length(), BytesSent))
     {
-        UE_LOG(LogTemp, Warning, TEXT("MCPServer: failed to send response for '%s'"), *CommandType);
+        UE_LOG(LogMCPServer, Warning, TEXT("MCPServer: failed to send response for '%s' (%d bytes)"), *CommandType, Utf8.Length());
+    }
+    else
+    {
+        UE_LOG(LogMCPServer, Log, TEXT("MCPServer: << %s (%d bytes)"), *CommandType, BytesSent);
     }
 }

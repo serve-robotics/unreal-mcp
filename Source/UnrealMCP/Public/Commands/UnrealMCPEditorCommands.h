@@ -34,4 +34,7 @@ private:
 
     // Python execution
     TSharedPtr<FJsonObject> HandleExecutePython(const TSharedPtr<FJsonObject>& Params);
+
+    // Lighting setup
+    TSharedPtr<FJsonObject> HandleAddBasicLighting(const TSharedPtr<FJsonObject>& Params);
 };

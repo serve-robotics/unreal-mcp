@@ -52,10 +52,18 @@ public class UnrealMCP : ModuleRules
 				"BlueprintGraph",
 				"Projects",
 				"AssetRegistry",
-				"PythonScriptPlugin"
+				"PythonScriptPlugin",
+				// GIS integration
+				"ServeGISToolsRuntime",
+				"ServeGISToolsEditor",
+				"GDAL",
+				"GDALThirdParty",
+				"Landscape",
+				"RoadBLDRuntime",
+				"LevelEditor",
 			}
 		);
-		
+
 		if (Target.bBuildEditor == true)
 		{
 			PrivateDependencyModuleNames.AddRange(
@@ -64,7 +72,8 @@ public class UnrealMCP : ModuleRules
 					"PropertyEditor",      // For widget property editing
 					"ToolMenus",           // For editor UI
 					"BlueprintEditorLibrary", // For Blueprint utilities
-					"UMGEditor"           // For WidgetBlueprint.h and other UMG editor functionality
+					"UMGEditor",          // For WidgetBlueprint.h and other UMG editor functionality
+					"LandscapeEditor",    // GIS landscape creation
 				}
 			);
 		}

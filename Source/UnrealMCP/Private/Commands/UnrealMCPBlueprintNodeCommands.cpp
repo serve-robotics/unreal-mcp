@@ -17,8 +17,7 @@
 #include "Kismet/GameplayStatics.h"
 #include "EdGraphSchema_K2.h"
 
-// Declare the log category
-DEFINE_LOG_CATEGORY_STATIC(LogUnrealMCP, Log, All);
+// Log category defined in UnrealMCPBridge.cpp; extern declared via UnrealMCPBridge.h
 
 FUnrealMCPBlueprintNodeCommands::FUnrealMCPBlueprintNodeCommands()
 {
