@@ -23,6 +23,8 @@
 #include "DynamicRoad/DynamicRoadNetwork.h"
 #include "DynamicRoad/DynamicRoadData.h"
 
+#include "Engine/Blueprint.h"
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -63,8 +65,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_viewer_load_file"))   return HandleViewerLoadFile(Params);
     if (CommandType == TEXT("gis_viewer_list_layers")) return HandleViewerListLayers(Params);
     if (CommandType == TEXT("gis_viewer_clear"))       return HandleViewerClear(Params);
-    if (CommandType == TEXT("gis_focus_landscapes"))   return HandleFocusLandscapes(Params);
-
+    if (CommandType == TEXT("gis_focus_landscapes"))      return HandleFocusLandscapes(Params);
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
 }
@@ -251,13 +252,24 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleImportOpenDRIVE(const TShar
                 TEXT("gis_import_opendrive: no ADynamicRoadNetwork in level — spawn one first"));
     }
 
+    // Helper: load preset CDO from a Blueprint asset path.
+    auto LoadPreset = [](const FString& Path) -> UDynamicRoadDrawPreset*
+    {
+        UObject* Loaded = UEditorAssetLibrary::LoadAsset(Path);
+        if (UBlueprint* BP = Cast<UBlueprint>(Loaded))
+        {
+            if (BP->GeneratedClass)
+                return Cast<UDynamicRoadDrawPreset>(BP->GeneratedClass->GetDefaultObject(false));
+        }
+        return Cast<UDynamicRoadDrawPreset>(Loaded);
+    };
+
     // Resolve preset asset (optional)
     UDynamicRoadDrawPreset* Preset = nullptr;
     FString PresetPath;
-    if (Params->TryGetStringField(TEXT("preset_path"), PresetPath))
+    if (Params->TryGetStringField(TEXT("preset_path"), PresetPath) && !PresetPath.IsEmpty())
     {
-        UObject* Loaded = UEditorAssetLibrary::LoadAsset(PresetPath);
-        Preset = Cast<UDynamicRoadDrawPreset>(Loaded);
+        Preset = LoadPreset(PresetPath);
         if (!Preset)
             return FUnrealMCPCommonUtils::CreateErrorResponse(
                 FString::Printf(TEXT("gis_import_opendrive: preset not found: %s"), *PresetPath));
@@ -314,11 +326,14 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListRoadNetworks(const TSha
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListRoadPresets(const TSharedPtr<FJsonObject>& Params)
 {
+    // Presets are Blueprint assets whose GeneratedClass extends UDynamicRoadDrawPreset.
+    // Search the known preset directory and verify each one loads as a valid CDO.
     IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
 
     FARFilter Filter;
-    Filter.ClassPaths.Add(UDynamicRoadDrawPreset::StaticClass()->GetClassPathName());
-    Filter.bRecursiveClasses = true;
+    Filter.PackagePaths.Add(FName("/ServeGISTools/Roads/Presets"));
+    Filter.bRecursivePaths = true;
+    Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
 
     TArray<FAssetData> Assets;
     AR.GetAssets(Filter, Assets);
@@ -326,6 +341,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListRoadPresets(const TShar
     TArray<TSharedPtr<FJsonValue>> Presets;
     for (const FAssetData& AD : Assets)
     {
+        UObject* Loaded = UEditorAssetLibrary::LoadAsset(AD.GetObjectPathString());
+        UBlueprint* BP = Cast<UBlueprint>(Loaded);
+        if (!BP || !BP->GeneratedClass) { continue; }
+        if (!Cast<UDynamicRoadDrawPreset>(BP->GeneratedClass->GetDefaultObject(false))) { continue; }
+
         auto P = MakeShared<FJsonObject>();
         P->SetStringField(TEXT("name"), AD.AssetName.ToString());
         P->SetStringField(TEXT("path"), AD.GetObjectPathString());
@@ -435,53 +455,20 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleFocusLandscapes(const TShar
     if (!World)
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_focus_landscapes: no editor world"));
 
-    // Collect combined XY bounds of all landscape actors.
-    // We intentionally ignore Z extent: landscape actors have a large Z scale
-    // (proportional to elevation range) that inflates GetActorBounds and
-    // pushes the bounding-box center far underground.  Instead we use each
-    // landscape's XY footprint and the actor's own spawn Z as the ground ref.
-    FBox2D CombinedXY(ForceInit);
-    float  GroundZ     = 0.f;
-    int32  LandscapeCount = 0;
+    // Build combined 3D AABB of all landscape actors.
+    FBox CombinedBox(ForceInit);
+    int32 LandscapeCount = 0;
     for (TActorIterator<ALandscape> It(World); It; ++It)
     {
         FVector Origin, Extent;
         It->GetActorBounds(/*bOnlyCollidingComponents=*/false, Origin, Extent);
-        CombinedXY += FBox2D(
-            FVector2D(Origin.X - Extent.X, Origin.Y - Extent.Y),
-            FVector2D(Origin.X + Extent.X, Origin.Y + Extent.Y));
-        GroundZ = It->GetActorLocation().Z;
+        CombinedBox += FBox(Origin - Extent, Origin + Extent);
         ++LandscapeCount;
     }
 
     if (LandscapeCount == 0)
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_focus_landscapes: no Landscape actors in level"));
 
-    const FVector2D Center2D   = CombinedXY.GetCenter();
-    const FVector2D Extents2D  = CombinedXY.GetExtent();
-    const FVector   Center(Center2D.X, Center2D.Y, GroundZ);
-    const float     MaxExtentXY = FMath::Max(Extents2D.X, Extents2D.Y);
-
-    // Camera pitch / yaw — 3/4 angle: looking down from above at 45 degrees.
-    const float Pitch = Params->HasField(TEXT("pitch")) ? (float)Params->GetNumberField(TEXT("pitch")) : -45.f;
-    const float Yaw   = Params->HasField(TEXT("yaw"))   ? (float)Params->GetNumberField(TEXT("yaw"))   :  45.f;
-
-    // Distance from center: enough so the landscape just fits in a ~90-degree FOV.
-    // With 45-degree pitch, distance = MaxExtent / tan(45) = MaxExtent, then we
-    // raise it by the same amount to account for the pitch offset.
-    const float Distance = MaxExtentXY * 1.5f;
-
-    // Camera position: offset from center along the -yaw direction and +Z.
-    const float PitchRad = FMath::DegreesToRadians(Pitch);
-    const float YawRad   = FMath::DegreesToRadians(Yaw);
-    const FVector CamOffset(
-        -FMath::Cos(PitchRad) * FMath::Cos(YawRad) * Distance,
-        -FMath::Cos(PitchRad) * FMath::Sin(YawRad) * Distance,
-        -FMath::Sin(PitchRad) * Distance
-    );
-    const FVector CamLocation = Center + CamOffset;
-
-    // Apply to the active level editor viewport.
     if (!GEditor)
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_focus_landscapes: GEditor unavailable"));
 
@@ -495,6 +482,61 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleFocusLandscapes(const TShar
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_focus_landscapes: no active viewport"));
 
     FLevelEditorViewportClient* VC = &ActiveViewport->GetLevelViewportClient();
+
+    // Camera pitch / yaw — 3/4 angle: looking down from above at 45 degrees.
+    const float Pitch = Params->HasField(TEXT("pitch")) ? (float)Params->GetNumberField(TEXT("pitch")) : -45.f;
+    const float Yaw   = Params->HasField(TEXT("yaw"))   ? (float)Params->GetNumberField(TEXT("yaw"))   :  45.f;
+
+    // Camera basis vectors: Forward points from camera toward the box center.
+    // Right = cross(WorldUp, Forward).  Up = cross(Forward, Right).
+    const float PitchRad = FMath::DegreesToRadians(Pitch);
+    const float YawRad   = FMath::DegreesToRadians(Yaw);
+    const FVector Forward(
+        FMath::Cos(PitchRad) * FMath::Cos(YawRad),
+        FMath::Cos(PitchRad) * FMath::Sin(YawRad),
+        FMath::Sin(PitchRad));
+    const FVector Right = FVector::CrossProduct(FVector::UpVector, Forward).GetSafeNormal();
+    const FVector Up    = FVector::CrossProduct(Forward, Right).GetSafeNormal();
+
+    // Viewport FOV from the viewport client (horizontal), derive vertical from aspect ratio.
+    const FIntPoint ViewportSize = VC->Viewport ? VC->Viewport->GetSizeXY() : FIntPoint(1920, 1080);
+    const float AspectRatio = (ViewportSize.Y > 0)
+        ? (float)ViewportSize.X / (float)ViewportSize.Y
+        : (16.f / 9.f);
+    const float HFovRad  = FMath::DegreesToRadians(FMath::Max(VC->ViewFOV, 10.f));
+    const float HalfHTan = FMath::Tan(HFovRad * 0.5f);
+    const float VFovRad  = 2.f * FMath::Atan(HalfHTan / AspectRatio);
+    const float HalfVTan = FMath::Tan(VFovRad * 0.5f);
+
+    // For a camera at P = BoxCenter - Forward * D, each corner Q projects to:
+    //   x_c = dot(Q - BoxCenter, Right)   — independent of D
+    //   y_c = dot(Q - BoxCenter, Up)      — independent of D
+    //   z_c = dot(Q - BoxCenter, Forward) + D
+    //
+    // Visibility requires:  |x_c| / z_c <= HalfHTan  and  |y_c| / z_c <= HalfVTan
+    // Rearranging:          D >= |x_c| / HalfHTan - z_d
+    //                       D >= |y_c| / HalfVTan - z_d   (where z_d = dot(delta, Forward))
+    const FVector BoxCenter = CombinedBox.GetCenter();
+    const FVector BoxExtent = CombinedBox.GetExtent();
+
+    float DMin = 1.f;
+    for (int32 i = 0; i < 8; ++i)
+    {
+        const FVector Corner = BoxCenter + FVector(
+            (i & 1) ? BoxExtent.X : -BoxExtent.X,
+            (i & 2) ? BoxExtent.Y : -BoxExtent.Y,
+            (i & 4) ? BoxExtent.Z : -BoxExtent.Z);
+        const FVector Delta = Corner - BoxCenter;
+        const float XC = FVector::DotProduct(Delta, Right);
+        const float YC = FVector::DotProduct(Delta, Up);
+        const float ZD = FVector::DotProduct(Delta, Forward);
+        DMin = FMath::Max(DMin, FMath::Abs(XC) / HalfHTan - ZD);
+        DMin = FMath::Max(DMin, FMath::Abs(YC) / HalfVTan - ZD);
+    }
+
+    const float Distance  = DMin * 1.05f; // 5% margin so corners aren't flush with frustum edges
+    const FVector CamLocation = BoxCenter - Forward * Distance;
+
     VC->SetViewLocation(CamLocation);
     VC->SetViewRotation(FRotator(Pitch, Yaw, 0.f));
     VC->Invalidate();
@@ -506,5 +548,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleFocusLandscapes(const TShar
         FString::Printf(TEXT("(%.0f, %.0f, %.0f)"), CamLocation.X, CamLocation.Y, CamLocation.Z));
     R->SetStringField(TEXT("camera_rotation"),
         FString::Printf(TEXT("pitch=%.1f yaw=%.1f"), Pitch, Yaw));
+    R->SetStringField(TEXT("fov"),
+        FString::Printf(TEXT("h=%.1f v=%.1f aspect=%.3f"),
+            FMath::RadiansToDegrees(HFovRad),
+            FMath::RadiansToDegrees(VFovRad),
+            AspectRatio));
     return R;
 }
+
