@@ -30,4 +30,7 @@ private:
 
     // Camera
     TSharedPtr<FJsonObject> HandleFocusLandscapes(const TSharedPtr<FJsonObject>& Params);
+
+    // Report markers
+    TSharedPtr<FJsonObject> HandleScreenshotMarkers(const TSharedPtr<FJsonObject>& Params);
 };

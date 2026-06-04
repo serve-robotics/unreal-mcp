@@ -424,6 +424,10 @@ TArray<TSharedPtr<FJsonValue>> FUnrealMCPCLIBridge::BuildToolList()
         TEXT("Capture a screenshot and save to the given path"),
         SimpleSchema({{"path", "Output file path (.png)"}}, {"path"})));
 
+    Add(MakeTool(TEXT("add_basic_lighting"),
+        TEXT("Add a basic lighting setup to the current level: DirectionalLight (sun), SkyAtmosphere, SkyLight, and ExponentialHeightFog. Skips any actor type already present. Returns a list of spawned actors."),
+        SimpleSchema({}, {})));
+
     Add(MakeTool(TEXT("spawn_blueprint_actor"),
         TEXT("Spawn an instance of a Blueprint class in the level"),
         SimpleSchema({
@@ -522,6 +526,98 @@ TArray<TSharedPtr<FJsonValue>> FUnrealMCPCLIBridge::BuildToolList()
     Add(MakeTool(TEXT("add_widget_to_viewport"),
         TEXT("Instantiate a Widget Blueprint and add it to the game viewport"),
         SimpleSchema({{"widget_name", "Widget Blueprint name"}}, {"widget_name"})));
+
+    // ---- GIS commands ----
+    Add(MakeTool(TEXT("gis_create_level"),
+        TEXT("Create a new empty UE level and open it. Tip: use /Game/Maps/<Name> as level_path."),
+        SimpleSchema({
+            {"level_path", "Content-browser path for the new level (e.g. /Game/Maps/CityBlock01)"}
+        }, {"level_path"})));
+
+    Add(MakeTool(TEXT("gis_open_level"),
+        TEXT("Open an existing level by content-browser path"),
+        SimpleSchema({
+            {"level_path", "Content-browser path (e.g. /Game/Maps/CityBlock01)"}
+        }, {"level_path"})));
+
+    Add(MakeTool(TEXT("gis_get_geo_anchor"),
+        TEXT("Return the AServeGeoAnchor properties from the current level (EPSG, origin, elevation range, m/quad)"),
+        SimpleSchema({})));
+
+    Add(MakeTool(TEXT("gis_set_geo_anchor"),
+        TEXT("Create or update the AServeGeoAnchor in the current level. All params optional except at least one must be set."),
+        SimpleSchema({
+            {"epsg",           "EPSG code of project CRS (e.g. 32618 for UTM zone 18N)"},
+            {"origin_x",       "World-origin easting/longitude in project CRS"},
+            {"origin_y",       "World-origin northing/latitude in project CRS"},
+            {"origin_z",       "World-origin elevation in meters"},
+            {"min_elev",       "Global minimum elevation (meters) for landscape encoding"},
+            {"max_elev",       "Global maximum elevation (meters) for landscape encoding"},
+            {"meters_per_quad","Preferred landscape meters-per-quad (XY scale)"},
+            {"crs_wkt",        "Optional full WKT for the project CRS (overrides EPSG if set)"}
+        }, {})));
+
+    Add(MakeTool(TEXT("gis_import_landscape"),
+        TEXT("Import a raster file (GeoTIFF, etc.) as one or more UE Landscape actors. Async — may take 30-120 s for large tiles."),
+        SimpleSchema({
+            {"dataset_path",   "Absolute path to the raster file (GeoTIFF, .img, .asc, etc.)"},
+            {"meters_per_quad","Landscape horizontal scale in meters per quad (default 5.0)"},
+            {"elevation_band", "1-based band index for elevation (default: auto-detect)"},
+            {"min_elev",       "Min elevation in meters — if omitted, computed from data"},
+            {"max_elev",       "Max elevation in meters — if omitted, computed from data"}
+        }, {"dataset_path"})));
+
+    Add(MakeTool(TEXT("gis_import_vector_roads"),
+        TEXT("Import line-string features from a vector file (.gpkg, .shp, .geojson, etc.) as RoadBLD roads. Async — may take 10-60 s for large datasets."),
+        SimpleSchema({
+            {"dataset_path",   "Absolute path to the vector file (.gpkg, .shp, .geojson, etc.)"},
+            {"network_name",   "Label of the ADynamicRoadNetwork actor to use (optional — uses first found, or creates one)"},
+            {"preset_path",    "Content-browser path to a UDynamicRoadDrawPreset asset (optional)"},
+            {"is_geographic",  "true if source CRS is geographic (degrees), e.g. EPSG:4326/4269 (default: auto-detect)"},
+            {"merge_segments", "true to stitch disjoint line segments into longer chains (default: false — merging can produce degenerate shapes in some gpkg files)"},
+            {"sample_eps",     "RDP simplification tolerance in meters (default: disabled)"}
+        }, {"dataset_path"})));
+
+    Add(MakeTool(TEXT("gis_import_opendrive"),
+        TEXT("Import roads from an OpenDRIVE (.xodr) file into an ADynamicRoadNetwork actor"),
+        SimpleSchema({
+            {"file_path",    "Absolute path to the .xodr file"},
+            {"network_name", "Label of the ADynamicRoadNetwork actor (optional — uses first found if omitted)"},
+            {"preset_path",  "Content-browser path to a UDynamicRoadDrawPreset asset (optional)"},
+            {"sample_eps",   "Chord-error tolerance in meters for reference-line sampling (default 0.5)"}
+        }, {"file_path"})));
+
+    Add(MakeTool(TEXT("gis_list_road_networks"),
+        TEXT("List all ADynamicRoadNetwork actors in the current level"),
+        SimpleSchema({})));
+
+    Add(MakeTool(TEXT("gis_list_road_presets"),
+        TEXT("List all UDynamicRoadDrawPreset assets in the project (use path with gis_import_opendrive)"),
+        SimpleSchema({})));
+
+    Add(MakeTool(TEXT("gis_viewer_load_file"),
+        TEXT("Load a GIS file (GeoTIFF, .gpkg, .shp, .xodr, etc.) into the GIS Viewer dataset so it appears in the viewer panel"),
+        SimpleSchema({
+            {"file_path", "Absolute path to the GIS file to load"}
+        }, {"file_path"})));
+
+    Add(MakeTool(TEXT("gis_viewer_list_layers"),
+        TEXT("List all layers currently loaded in the GIS Viewer dataset"),
+        SimpleSchema({})));
+
+    Add(MakeTool(TEXT("gis_viewer_clear"),
+        TEXT("Remove all layers from the GIS Viewer dataset"),
+        SimpleSchema({})));
+
+    Add(MakeTool(TEXT("gis_screenshot_markers"),
+        TEXT("Iterate GIS Report Marker actors in the level and capture two screenshots per marker: "
+             "a perspective view (pitch=-45, yaw=45) and a top-down view. "
+             "The framing box is the actor's own bounds inflated by the inflate factor. "
+             "Returns an array of entries with actor name, label, lat/lon, and screenshot paths."),
+        SimpleSchema({
+            {"tag",     "Actor tag filter — only process markers with this tag (omit to include all)"},
+            {"inflate", "Multiplier applied to the actor's bounds extent for the framing box (default 5)"}
+        }, {})));
 
     return Tools;
 }

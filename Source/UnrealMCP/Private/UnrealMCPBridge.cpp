@@ -1083,7 +1083,8 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_viewer_load_file") ||
                      CommandType == TEXT("gis_viewer_list_layers") ||
                      CommandType == TEXT("gis_viewer_clear") ||
-                     CommandType == TEXT("gis_focus_landscapes"))
+                     CommandType == TEXT("gis_focus_landscapes") ||
+                     CommandType == TEXT("gis_screenshot_markers"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);
             }
