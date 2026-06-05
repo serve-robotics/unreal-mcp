@@ -868,6 +868,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         FString Out;
         TSharedRef<TJsonWriter<>> W2 = TJsonWriterFactory<>::Create(&Out);
         FJsonSerializer::Serialize(T.ToSharedRef(), W2);
+        PendingVectorRoadsPromise->SetValue(Out);
         PendingVectorRoadsPromise.Reset();
         return Out;
     }
@@ -909,6 +910,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         FString Out;
         TSharedRef<TJsonWriter<>> W2 = TJsonWriterFactory<>::Create(&Out);
         FJsonSerializer::Serialize(T.ToSharedRef(), W2);
+        PendingGISPromise->SetValue(Out);
         PendingGISPromise.Reset();
         return Out;
     }
