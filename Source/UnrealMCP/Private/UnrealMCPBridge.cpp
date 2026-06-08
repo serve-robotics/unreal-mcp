@@ -855,7 +855,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         });
 
         constexpr float PollSec  = 0.05f;
-        constexpr float LimitSec = 300.f;
+        constexpr float LimitSec = 900.f;
         for (float Elapsed = 0.f; Elapsed < LimitSec; Elapsed += PollSec)
         {
             if (VRFuture.IsReady()) return VRFuture.Get();
@@ -864,7 +864,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
 
         TSharedPtr<FJsonObject> T = MakeShared<FJsonObject>();
         T->SetStringField(TEXT("status"), TEXT("error"));
-        T->SetStringField(TEXT("error"), TEXT("gis_import_vector_roads timed out after 300 s"));
+        T->SetStringField(TEXT("error"), TEXT("gis_import_vector_roads timed out after 900 s"));
         FString Out;
         TSharedRef<TJsonWriter<>> W2 = TJsonWriterFactory<>::Create(&Out);
         FJsonSerializer::Serialize(T.ToSharedRef(), W2);
