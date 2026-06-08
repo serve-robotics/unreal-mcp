@@ -2,6 +2,9 @@
 #include "Commands/UnrealMCPCommonUtils.h"
 
 #include "Editor.h"
+#include "TempoRoadLaneGraphSubsystem.h"
+#include "TempoRoadInterface.h"
+#include "ZoneShapeComponent.h"
 #include "EditorAssetLibrary.h"
 #include "EngineUtils.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -68,6 +71,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_viewer_clear"))       return HandleViewerClear(Params);
     if (CommandType == TEXT("gis_focus_landscapes"))      return HandleFocusLandscapes(Params);
     if (CommandType == TEXT("gis_screenshot_markers"))    return HandleScreenshotMarkers(Params);
+    if (CommandType == TEXT("gis_build_zone_graph"))      return HandleBuildZoneGraph(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -731,6 +735,73 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotMarkers(
     R->SetBoolField(TEXT("success"), true);
     R->SetNumberField(TEXT("marker_count"), Markers.Num());
     R->SetArrayField(TEXT("markers"), Results);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_build_zone_graph
+// Runs the full Tempo zone graph pipeline on the current level:
+//   SetupZoneGraphBuilder → TryGenerateZoneShapeComponents → BuildZoneGraph
+// GIS-imported ADynamicRoad actors implement ITempoRoadInterface and will
+// have UZoneShapeComponents placed on them and the ZoneGraph rebuilt.
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleBuildZoneGraph(const TSharedPtr<FJsonObject>& Params)
+{
+    if (!GEditor)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_build_zone_graph: GEditor unavailable"));
+
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_build_zone_graph: no editor world"));
+
+    UTempoRoadLaneGraphSubsystem* LaneGraphSubsystem =
+        GEditor->GetEditorSubsystem<UTempoRoadLaneGraphSubsystem>();
+    if (!LaneGraphSubsystem)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_build_zone_graph: UTempoRoadLaneGraphSubsystem unavailable — is TempoAgents enabled?"));
+
+    // Step 1: register FTempoZoneGraphBuilder with the ZoneGraph subsystem.
+    LaneGraphSubsystem->SetupZoneGraphBuilder();
+
+    // Count ITempoRoadInterface actors so the caller gets a sanity-check number.
+    int32 RoadCount = 0;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        if (IsValid(*It) && (*It)->Implements<UTempoRoadInterface>())
+            ++RoadCount;
+    }
+
+    // Step 2: walk all road/intersection actors and attach UZoneShapeComponents.
+    if (!LaneGraphSubsystem->TryGenerateZoneShapeComponents())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(
+                TEXT("gis_build_zone_graph: TryGenerateZoneShapeComponents failed (%d road actors found — check log for details)"),
+                RoadCount));
+    }
+
+    // Step 3: trigger the ZoneGraph rebuild delegate.
+    LaneGraphSubsystem->BuildZoneGraph();
+
+    // Count UZoneShapeComponents now attached to actors — definitive proof shapes landed.
+    int32 ZoneShapeCount = 0;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        if (IsValid(*It))
+        {
+            TArray<UZoneShapeComponent*> Shapes;
+            (*It)->GetComponents<UZoneShapeComponent>(Shapes);
+            ZoneShapeCount += Shapes.Num();
+        }
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), true);
+    R->SetNumberField(TEXT("road_actor_count"), RoadCount);
+    R->SetNumberField(TEXT("zone_shape_count"), ZoneShapeCount);
+    R->SetStringField(TEXT("message"),
+        FString::Printf(TEXT("Zone graph built: %d road actors, %d zone shapes placed"), RoadCount, ZoneShapeCount));
     return R;
 }
 

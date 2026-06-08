@@ -619,6 +619,14 @@ TArray<TSharedPtr<FJsonValue>> FUnrealMCPCLIBridge::BuildToolList()
             {"inflate", "Multiplier applied to the actor's bounds extent for the framing box (default 5)"}
         }, {})));
 
+    Add(MakeTool(TEXT("gis_build_zone_graph"),
+        TEXT("Run the full Tempo zone graph pipeline on the current level: "
+             "SetupZoneGraphBuilder → TryGenerateZoneShapeComponents → BuildZoneGraph. "
+             "GIS-imported road actors (ADynamicRoad) implement ITempoRoadInterface and will "
+             "receive UZoneShapeComponents; the ZoneGraph is then rebuilt. "
+             "Returns road_actor_count and a success message, or an error with diagnostic info."),
+        SimpleSchema({}, {})));
+
     return Tools;
 }
 
