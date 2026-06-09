@@ -4,10 +4,6 @@
 #include "Editor.h"
 #include "EditorViewportClient.h"
 #include "LevelEditorViewport.h"
-#include "ImageUtils.h"
-#include "HighResScreenshot.h"
-#include "Engine/GameViewportClient.h"
-#include "Misc/FileHelper.h"
 #include "GameFramework/Actor.h"
 #include "Engine/Selection.h"
 #include "Kismet/GameplayStatics.h"
@@ -15,6 +11,11 @@
 #include "Engine/DirectionalLight.h"
 #include "Engine/PointLight.h"
 #include "Engine/SpotLight.h"
+#include "Engine/SkyLight.h"
+#include "Engine/ExponentialHeightFog.h"
+#include "Components/SkyAtmosphereComponent.h"
+#include "Components/DirectionalLightComponent.h"
+#include "Components/SkyLightComponent.h"
 #include "Camera/CameraActor.h"
 #include "Components/StaticMeshComponent.h"
 #include "EditorSubsystem.h"
@@ -71,13 +72,13 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     {
         return HandleFocusViewport(Params);
     }
-    else if (CommandType == TEXT("take_screenshot"))
-    {
-        return HandleTakeScreenshot(Params);
-    }
     else if (CommandType == TEXT("execute_python"))
     {
         return HandleExecutePython(Params);
+    }
+    else if (CommandType == TEXT("add_basic_lighting"))
+    {
+        return HandleAddBasicLighting(Params);
     }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown editor command: %s"), *CommandType));
@@ -567,42 +568,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFocusViewport(const TSha
 
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleTakeScreenshot(const TSharedPtr<FJsonObject>& Params)
 {
-    // Get file path parameter
-    FString FilePath;
-    if (!Params->TryGetStringField(TEXT("filepath"), FilePath))
-    {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'filepath' parameter"));
-    }
-    
-    // Ensure the file path has a proper extension
-    if (!FilePath.EndsWith(TEXT(".png")))
-    {
-        FilePath += TEXT(".png");
-    }
+    // Handled by UUnrealMCPBridge::ExecuteCommand to avoid blocking the game thread.
+    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("take_screenshot: internal routing error"));
+}
 
-    // Get the active viewport
-    if (GEditor && GEditor->GetActiveViewport())
-    {
-        FViewport* Viewport = GEditor->GetActiveViewport();
-        TArray<FColor> Bitmap;
-        FIntRect ViewportRect(0, 0, Viewport->GetSizeXY().X, Viewport->GetSizeXY().Y);
-        
-        if (Viewport->ReadPixels(Bitmap, FReadSurfaceDataFlags(), ViewportRect))
-        {
-            TArray64<uint8> CompressedBitmap;
-            FImageUtils::PNGCompressImageArray(Viewport->GetSizeXY().X, Viewport->GetSizeXY().Y, TArrayView64<const FColor>(Bitmap.GetData(), Bitmap.Num()), CompressedBitmap);
-
-            if (FFileHelper::SaveArrayToFile(CompressedBitmap, *FilePath))
-            {
-                TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-                ResultObj->SetStringField(TEXT("filepath"), FilePath);
-                return ResultObj;
-            }
-        }
-    }
-    
-    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to take screenshot"));
-} 
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleExecutePython(const TSharedPtr<FJsonObject>& Params)
 {
     FString Script;
@@ -617,8 +586,15 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleExecutePython(const TSha
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("execute_python: Python scripting is not available"));
     }
 
+    // Write script to a temp file and run via ExecuteFile.
+    // ExecuteStatement has line-length limits; ExecuteFile handles arbitrary multi-line scripts.
+    const FString TmpDir  = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("Temp"));
+    const FString TmpPath = TmpDir / TEXT("mcp_script.py");
+    IFileManager::Get().MakeDirectory(*TmpDir, /*Tree=*/true);
+    FFileHelper::SaveStringToFile(Script, *TmpPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+
     FPythonCommandEx Cmd;
-    Cmd.Command = Script;
+    Cmd.Command = TmpPath;
     Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
     Cmd.FileExecutionScope = EPythonFileExecutionScope::Public;
 
@@ -634,5 +610,158 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleExecutePython(const TSha
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(Cmd.CommandResult);
     }
+    return Result;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleAddBasicLighting(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get editor world"));
+    }
+
+    auto TypeExists = [&](UClass* Class) -> bool
+    {
+        TArray<AActor*> Found;
+        UGameplayStatics::GetAllActorsOfClass(World, Class, Found);
+        return Found.Num() > 0;
+    };
+
+    TArray<TSharedPtr<FJsonValue>> Spawned;
+
+    // Track directional light for sky sphere wiring below.
+    ADirectionalLight* DLActor = nullptr;
+
+    // Directional light — mid-morning sun angle, atmosphere sun enabled.
+    if (!TypeExists(ADirectionalLight::StaticClass()))
+    {
+        FActorSpawnParameters P;
+        P.Name = TEXT("BasicDirectionalLight");
+        ADirectionalLight* DL = World->SpawnActor<ADirectionalLight>(
+            ADirectionalLight::StaticClass(),
+            FVector::ZeroVector, FRotator(-50.0f, -60.0f, 0.0f), P);
+        if (DL)
+        {
+            DL->SetActorLabel(TEXT("Sun"));
+            DLActor = DL;
+            if (UDirectionalLightComponent* DLC = Cast<UDirectionalLightComponent>(DL->GetLightComponent()))
+            {
+                DLC->SetAtmosphereSunLight(true);
+            }
+            TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+            O->SetStringField(TEXT("type"), TEXT("DirectionalLight"));
+            O->SetStringField(TEXT("name"), DL->GetActorLabel());
+            Spawned.Add(MakeShared<FJsonValueObject>(O));
+        }
+    }
+    else
+    {
+        TArray<AActor*> Existing;
+        UGameplayStatics::GetAllActorsOfClass(World, ADirectionalLight::StaticClass(), Existing);
+        if (Existing.Num() > 0)
+            DLActor = Cast<ADirectionalLight>(Existing[0]);
+    }
+
+    // Sky atmosphere — physical sky color driven by the directional light.
+    if (!TypeExists(ASkyAtmosphere::StaticClass()))
+    {
+        FActorSpawnParameters P;
+        P.Name = TEXT("BasicSkyAtmosphere");
+        ASkyAtmosphere* SA = World->SpawnActor<ASkyAtmosphere>(
+            ASkyAtmosphere::StaticClass(),
+            FVector::ZeroVector, FRotator::ZeroRotator, P);
+        if (SA)
+        {
+            TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+            O->SetStringField(TEXT("type"), TEXT("SkyAtmosphere"));
+            O->SetStringField(TEXT("name"), SA->GetName());
+            Spawned.Add(MakeShared<FJsonValueObject>(O));
+        }
+    }
+
+    // Sky light — real-time capture for accurate ambient IBL.
+    if (!TypeExists(ASkyLight::StaticClass()))
+    {
+        FActorSpawnParameters P;
+        P.Name = TEXT("BasicSkyLight");
+        ASkyLight* SL = World->SpawnActor<ASkyLight>(
+            ASkyLight::StaticClass(),
+            FVector::ZeroVector, FRotator::ZeroRotator, P);
+        if (SL)
+        {
+            if (USkyLightComponent* SLC = SL->GetLightComponent())
+            {
+                SLC->bRealTimeCapture = true;
+                SLC->RecaptureSky();
+            }
+            TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+            O->SetStringField(TEXT("type"), TEXT("SkyLight"));
+            O->SetStringField(TEXT("name"), SL->GetName());
+            Spawned.Add(MakeShared<FJsonValueObject>(O));
+        }
+    }
+
+    // Exponential height fog — aerial perspective.
+    if (!TypeExists(AExponentialHeightFog::StaticClass()))
+    {
+        FActorSpawnParameters P;
+        P.Name = TEXT("BasicExponentialHeightFog");
+        AExponentialHeightFog* Fog = World->SpawnActor<AExponentialHeightFog>(
+            AExponentialHeightFog::StaticClass(),
+            FVector::ZeroVector, FRotator::ZeroRotator, P);
+        if (Fog)
+        {
+            TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+            O->SetStringField(TEXT("type"), TEXT("ExponentialHeightFog"));
+            O->SetStringField(TEXT("name"), Fog->GetName());
+            Spawned.Add(MakeShared<FJsonValueObject>(O));
+        }
+    }
+
+    // BP_Sky_Sphere — engine default sky backdrop.
+    // Try both with and without the explicit object name suffix.
+    static const TCHAR* SkySphereAssetPath = TEXT("/Engine/EngineSky/BP_Sky_Sphere.BP_Sky_Sphere");
+    UBlueprint* SkySphereBlueprint = LoadObject<UBlueprint>(nullptr, SkySphereAssetPath);
+    if (!SkySphereBlueprint)
+    {
+        SkySphereBlueprint = LoadObject<UBlueprint>(nullptr, TEXT("/Engine/EngineSky/BP_Sky_Sphere"));
+    }
+    UE_LOG(LogUnrealMCP, Log, TEXT("add_basic_lighting: BP_Sky_Sphere load=%s"),
+        SkySphereBlueprint ? TEXT("ok") : TEXT("FAILED — engine content not accessible?"));
+    if (SkySphereBlueprint && SkySphereBlueprint->GeneratedClass)
+    {
+        UE_LOG(LogUnrealMCP, Log, TEXT("add_basic_lighting: GeneratedClass=%s"),
+            *SkySphereBlueprint->GeneratedClass->GetName());
+    }
+    if (SkySphereBlueprint && SkySphereBlueprint->GeneratedClass &&
+        !TypeExists(SkySphereBlueprint->GeneratedClass))
+    {
+        FActorSpawnParameters P;
+        P.Name = TEXT("BasicSkySphere");
+        AActor* SkySphere = World->SpawnActor(
+            SkySphereBlueprint->GeneratedClass,
+            &FVector::ZeroVector, &FRotator::ZeroRotator, P);
+        if (SkySphere)
+        {
+            // Wire the directional light so BP_Sky_Sphere drives sun color from it.
+            if (DLActor)
+            {
+                if (FObjectProperty* Prop = FindFProperty<FObjectProperty>(
+                        SkySphere->GetClass(), TEXT("Directional Light Actor")))
+                {
+                    Prop->SetObjectPropertyValue_InContainer(SkySphere, DLActor);
+                }
+            }
+            TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+            O->SetStringField(TEXT("type"), TEXT("BP_Sky_Sphere"));
+            O->SetStringField(TEXT("name"), SkySphere->GetName());
+            Spawned.Add(MakeShared<FJsonValueObject>(O));
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetArrayField(TEXT("actors_spawned"), Spawned);
+    Result->SetNumberField(TEXT("count"), Spawned.Num());
     return Result;
 }
