@@ -34,6 +34,9 @@ private:
     // Report markers
     TSharedPtr<FJsonObject> HandleScreenshotMarkers(const TSharedPtr<FJsonObject>& Params);
 
+    // Zone graph visualization screenshots
+    TSharedPtr<FJsonObject> HandleScreenshotZoneGraph(const TSharedPtr<FJsonObject>& Params);
+
     // Tempo zone graph pipeline
     TSharedPtr<FJsonObject> HandleBuildZoneGraph(const TSharedPtr<FJsonObject>& Params);
 };

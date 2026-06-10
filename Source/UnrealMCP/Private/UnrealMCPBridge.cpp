@@ -62,6 +62,9 @@
 #include "Misc/CommandLine.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
+#include "LevelEditor.h"
+#include "ILevelEditor.h"
+#include "SLevelViewport.h"
 
 // ServeGISTools — for async landscape + vector roads import
 #include "ProcessObjects/ServeProcessRasterToLandscape.h"
@@ -1000,6 +1003,143 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         return MakeJsonStr(Resp);
     }
 
+    // gis_screenshot_zone_graph: enable Navigation show flag (drives ZoneGraph lane rendering),
+    // take perspective + top-down screenshots, then restore the flag.
+    // Handled here (server thread) so the game thread is free to render while we poll for files.
+    if (CommandType == TEXT("gis_screenshot_zone_graph"))
+    {
+        auto MakeJsonStrZG = [](TSharedPtr<FJsonObject> Obj) -> FString {
+            FString S; TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&S);
+            FJsonSerializer::Serialize(Obj.ToSharedRef(), W); return S;
+        };
+        auto ErrZG = [&MakeJsonStrZG](const FString& Msg) -> FString {
+            TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
+            E->SetStringField(TEXT("status"), TEXT("error"));
+            E->SetStringField(TEXT("error"), Msg);
+            return MakeJsonStrZG(E);
+        };
+
+        // Step 1 — gather scene bounds, FOV, and enable Navigation show flag (game thread).
+        struct FZGContext { FBox Box; float HalfHTan=0; float HalfVTan=0; bool bWasNav=false; FString Err; };
+        TPromise<FZGContext> CtxPromise;
+        TFuture<FZGContext> CtxFuture = CtxPromise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread, [P = MoveTemp(CtxPromise)]() mutable {
+            FZGContext C;
+            UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+            if (!W) { C.Err = TEXT("gis_screenshot_zone_graph: no editor world"); P.SetValue(C); return; }
+            C.Box = FBox(ForceInit);
+            for (TActorIterator<ALandscape> It(W); It; ++It) {
+                FVector O, E; It->GetActorBounds(false, O, E);
+                C.Box += FBox(O-E, O+E);
+            }
+            if (!C.Box.IsValid) { C.Err = TEXT("gis_screenshot_zone_graph: no Landscape actors"); P.SetValue(C); return; }
+            auto& LEM = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+            auto LE = LEM.GetFirstLevelEditor();
+            if (!LE) { C.Err = TEXT("gis_screenshot_zone_graph: LevelEditor unavailable"); P.SetValue(C); return; }
+            auto VP = LE->GetActiveViewportInterface();
+            if (!VP) { C.Err = TEXT("gis_screenshot_zone_graph: no active viewport"); P.SetValue(C); return; }
+            FLevelEditorViewportClient* VC = &VP->GetLevelViewportClient();
+            C.bWasNav = VC->EngineShowFlags.Navigation != 0;
+            VC->EngineShowFlags.SetNavigation(true);
+            const FIntPoint Sz = VC->Viewport ? VC->Viewport->GetSizeXY() : FIntPoint(1920,1080);
+            const float Asp = Sz.Y > 0 ? (float)Sz.X/Sz.Y : 16.f/9.f;
+            const float HFov = FMath::DegreesToRadians(FMath::Max(VC->ViewFOV, 10.f));
+            C.HalfHTan = FMath::Tan(HFov * 0.5f);
+            C.HalfVTan = FMath::Tan(2.f * FMath::Atan(C.HalfHTan / Asp) * 0.5f);
+            VC->Invalidate();
+            P.SetValue(C);
+        });
+        FZGContext Ctx = CtxFuture.Get();
+        if (!Ctx.Err.IsEmpty()) return ErrZG(Ctx.Err);
+
+        // Step 2 — per-shot helper: position camera + fire HighResShot on game thread, poll here.
+        const FString ShotDir = FPaths::ConvertRelativePathToFull(FPaths::ScreenShotDir());
+        IFileManager& FM2 = IFileManager::Get();
+
+        // If "use_current_camera" is true, skip auto-framing and shoot from the current viewport position.
+        bool bUseCurrentCamera = false;
+        Params->TryGetBoolField(TEXT("use_current_camera"), bUseCurrentCamera);
+
+        auto TakeZGShot = [&](const FString& DestPath, float Pitch, float Yaw) -> bool {
+            TSet<FString> Before;
+            FM2.IterateDirectory(*ShotDir, [&Before](const TCHAR* P, bool bDir) -> bool {
+                if (!bDir) { FString N = FPaths::GetCleanFilename(P);
+                    if (N.StartsWith(TEXT("Highres")) && N.EndsWith(TEXT(".png"))) Before.Add(N); }
+                return true;
+            });
+            const FBox SBox = Ctx.Box;
+            const float HHT = Ctx.HalfHTan, HVT = Ctx.HalfVTan;
+            AsyncTask(ENamedThreads::GameThread, [SBox, HHT, HVT, Pitch, Yaw, bUseCurrentCamera]() {
+                auto& LEM2 = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+                auto LE2 = LEM2.GetFirstLevelEditor(); if (!LE2) return;
+                auto VP2 = LE2->GetActiveViewportInterface(); if (!VP2) return;
+                FLevelEditorViewportClient* VC2 = &VP2->GetLevelViewportClient();
+                if (!bUseCurrentCamera)
+                {
+                    const float PR = FMath::DegreesToRadians(Pitch), YR = FMath::DegreesToRadians(Yaw);
+                    const FVector Fwd(FMath::Cos(PR)*FMath::Cos(YR), FMath::Cos(PR)*FMath::Sin(YR), FMath::Sin(PR));
+                    const FVector Rt = FVector::CrossProduct(FVector::UpVector, Fwd).GetSafeNormal();
+                    const FVector Up = FVector::CrossProduct(Fwd, Rt).GetSafeNormal();
+                    const FVector Ctr = SBox.GetCenter(), Ext = SBox.GetExtent();
+                    float DMin = 1.f;
+                    for (int32 i = 0; i < 8; ++i) {
+                        const FVector C2 = Ctr + FVector((i&1)?Ext.X:-Ext.X,(i&2)?Ext.Y:-Ext.Y,(i&4)?Ext.Z:-Ext.Z);
+                        const FVector D2 = C2 - Ctr;
+                        DMin = FMath::Max(DMin, FMath::Abs(FVector::DotProduct(D2,Rt))/HHT - FVector::DotProduct(D2,Fwd));
+                        DMin = FMath::Max(DMin, FMath::Abs(FVector::DotProduct(D2,Up))/HVT - FVector::DotProduct(D2,Fwd));
+                    }
+                    VC2->SetViewLocation(Ctr - Fwd*(DMin*1.05f));
+                    VC2->SetViewRotation(FRotator(Pitch, Yaw, 0.f));
+                    VC2->Invalidate();
+                }
+                UWorld* W2 = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+                GEngine->Exec(W2, TEXT("HighResShot 1"));
+            });
+            FString NewFile;
+            const double Deadline = FPlatformTime::Seconds() + 20.0;
+            while (FPlatformTime::Seconds() < Deadline) {
+                FPlatformProcess::Sleep(0.15f);
+                FM2.IterateDirectory(*ShotDir, [&](const TCHAR* P, bool bDir) -> bool {
+                    if (!bDir) { FString N = FPaths::GetCleanFilename(P);
+                        if (N.StartsWith(TEXT("Highres")) && N.EndsWith(TEXT(".png")) && !Before.Contains(N))
+                            NewFile = P; }
+                    return true;
+                });
+                if (!NewFile.IsEmpty()) break;
+            }
+            if (NewFile.IsEmpty()) return false;
+            FM2.Copy(*DestPath, *NewFile);
+            return true;
+        };
+
+        const FString PerspPath = ShotDir / TEXT("zonegraph_persp.png");
+        const FString TopPath   = ShotDir / TEXT("zonegraph_top.png");
+        const bool bPerspOk = TakeZGShot(PerspPath, -45.f,  45.f);
+        const bool bTopOk   = TakeZGShot(TopPath,   -89.9f,  0.f);
+
+        // Step 3 — restore Navigation show flag (game thread, fire-and-forget).
+        const bool bWasNav = Ctx.bWasNav;
+        AsyncTask(ENamedThreads::GameThread, [bWasNav]() {
+            auto& LEM3 = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+            auto LE3 = LEM3.GetFirstLevelEditor(); if (!LE3) return;
+            auto VP3 = LE3->GetActiveViewportInterface(); if (!VP3) return;
+            FLevelEditorViewportClient* VC3 = &VP3->GetLevelViewportClient();
+            VC3->EngineShowFlags.SetNavigation(bWasNav);
+            VC3->Invalidate();
+        });
+
+        if (!bPerspOk && !bTopOk)
+            return ErrZG(TEXT("gis_screenshot_zone_graph: HighResShot did not produce files within timeout"));
+
+        TSharedPtr<FJsonObject> ZGResult = MakeShared<FJsonObject>();
+        ZGResult->SetStringField(TEXT("perspective"), bPerspOk ? PerspPath : TEXT("(failed)"));
+        ZGResult->SetStringField(TEXT("topdown"),     bTopOk   ? TopPath   : TEXT("(failed)"));
+        TSharedPtr<FJsonObject> ZGResp = MakeShared<FJsonObject>();
+        ZGResp->SetStringField(TEXT("status"), TEXT("success"));
+        ZGResp->SetObjectField(TEXT("result"), ZGResult);
+        return MakeJsonStrZG(ZGResp);
+    }
+
     // Create a promise to wait for the result
     TPromise<FString> Promise;
     TFuture<FString> Future = Promise.GetFuture();
@@ -1087,6 +1227,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_viewer_clear") ||
                      CommandType == TEXT("gis_focus_landscapes") ||
                      CommandType == TEXT("gis_screenshot_markers") ||
+                     CommandType == TEXT("gis_screenshot_zone_graph") ||
                      CommandType == TEXT("gis_build_zone_graph"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);

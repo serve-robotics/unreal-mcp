@@ -71,6 +71,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_viewer_clear"))       return HandleViewerClear(Params);
     if (CommandType == TEXT("gis_focus_landscapes"))      return HandleFocusLandscapes(Params);
     if (CommandType == TEXT("gis_screenshot_markers"))    return HandleScreenshotMarkers(Params);
+    if (CommandType == TEXT("gis_screenshot_zone_graph")) return HandleScreenshotZoneGraph(Params);
     if (CommandType == TEXT("gis_build_zone_graph"))      return HandleBuildZoneGraph(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
@@ -735,6 +736,138 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotMarkers(
     R->SetBoolField(TEXT("success"), true);
     R->SetNumberField(TEXT("marker_count"), Markers.Num());
     R->SetArrayField(TEXT("markers"), Results);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_screenshot_zone_graph
+// Takes perspective (-45°/45°) and top-down (-89.9°/0°) screenshots of the
+// current level with the Navigation show flag enabled so ZoneGraph lane shapes
+// are visible (Walkable=red, DrivingLane=purple, ClosedLane=blue, etc.).
+// The show flag is restored to its previous state after the shots are taken.
+// Returns: { "perspective": "<path>", "topdown": "<path>" }
+// ---------------------------------------------------------------------------
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotZoneGraph(
+    const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: no editor world"));
+    if (!GEditor)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: GEditor unavailable"));
+
+    // Build landscape bounding box (same logic as gis_focus_landscapes)
+    FBox SceneBox(ForceInit);
+    int32 LandscapeCount = 0;
+    for (TActorIterator<ALandscape> It(World); It; ++It)
+    {
+        FVector O, E;
+        It->GetActorBounds(false, O, E);
+        SceneBox += FBox(O - E, O + E);
+        ++LandscapeCount;
+    }
+    if (LandscapeCount == 0)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: no Landscape actors in level"));
+
+    FLevelEditorModule& LEM = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+    TSharedPtr<ILevelEditor> LE = LEM.GetFirstLevelEditor();
+    if (!LE.IsValid())
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: LevelEditor unavailable"));
+
+    TSharedPtr<SLevelViewport> VP = LE->GetActiveViewportInterface();
+    if (!VP.IsValid())
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: no active viewport"));
+
+    FLevelEditorViewportClient* VC = &VP->GetLevelViewportClient();
+
+    // Enable Navigation show flag (drives ZoneGraph lane rendering) and remember previous state
+    const bool bWasNavigation = VC->EngineShowFlags.Navigation != 0;
+    VC->EngineShowFlags.SetNavigation(true);
+    VC->Invalidate();
+
+    // Viewport FOV helpers
+    const FIntPoint VPSize  = VC->Viewport ? VC->Viewport->GetSizeXY() : FIntPoint(1920, 1080);
+    const float Aspect      = VPSize.Y > 0 ? (float)VPSize.X / (float)VPSize.Y : (16.f / 9.f);
+    const float HFovRad     = FMath::DegreesToRadians(FMath::Max(VC->ViewFOV, 10.f));
+    const float HalfHTan    = FMath::Tan(HFovRad * 0.5f);
+    const float HalfVTan    = FMath::Tan(2.f * FMath::Atan(HalfHTan / Aspect) * 0.5f);
+
+    auto FrameBox = [&](const FBox& Box, float Pitch, float Yaw)
+    {
+        const float PR = FMath::DegreesToRadians(Pitch);
+        const float YR = FMath::DegreesToRadians(Yaw);
+        const FVector Fwd(FMath::Cos(PR)*FMath::Cos(YR), FMath::Cos(PR)*FMath::Sin(YR), FMath::Sin(PR));
+        const FVector Rt = FVector::CrossProduct(FVector::UpVector, Fwd).GetSafeNormal();
+        const FVector Up = FVector::CrossProduct(Fwd, Rt).GetSafeNormal();
+        const FVector Ctr = Box.GetCenter();
+        const FVector Ext = Box.GetExtent();
+        float DMin = 1.f;
+        for (int32 i = 0; i < 8; ++i)
+        {
+            const FVector C = Ctr + FVector((i&1)?Ext.X:-Ext.X,(i&2)?Ext.Y:-Ext.Y,(i&4)?Ext.Z:-Ext.Z);
+            const FVector D = C - Ctr;
+            DMin = FMath::Max(DMin, FMath::Abs(FVector::DotProduct(D, Rt)) / HalfHTan - FVector::DotProduct(D, Fwd));
+            DMin = FMath::Max(DMin, FMath::Abs(FVector::DotProduct(D, Up)) / HalfVTan - FVector::DotProduct(D, Fwd));
+        }
+        VC->SetViewLocation(Ctr - Fwd * (DMin * 1.05f));
+        VC->SetViewRotation(FRotator(Pitch, Yaw, 0.f));
+        VC->Invalidate();
+    };
+
+    const FString ShotDir = FPaths::ConvertRelativePathToFull(FPaths::ScreenShotDir());
+    IFileManager& FM = IFileManager::Get();
+
+    auto TakeShot = [&](const FString& DestPath) -> bool
+    {
+        TSet<FString> Before;
+        FM.IterateDirectory(*ShotDir, [&Before](const TCHAR* P, bool) -> bool
+        {
+            FString N = FPaths::GetCleanFilename(P);
+            if (N.StartsWith(TEXT("Highres")) && N.EndsWith(TEXT(".png"))) Before.Add(N);
+            return true;
+        });
+        FPlatformProcess::Sleep(0.3f); // let the viewport render with nav flag enabled
+        AsyncTask(ENamedThreads::GameThread, []()
+        {
+            UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+            GEngine->Exec(W, TEXT("HighResShot 1"));
+        });
+        FString NewFile;
+        const double Deadline = FPlatformTime::Seconds() + 15.0;
+        while (FPlatformTime::Seconds() < Deadline)
+        {
+            FPlatformProcess::Sleep(0.1f);
+            FM.IterateDirectory(*ShotDir, [&](const TCHAR* P, bool) -> bool
+            {
+                FString N = FPaths::GetCleanFilename(P);
+                if (N.StartsWith(TEXT("Highres")) && N.EndsWith(TEXT(".png")) && !Before.Contains(N))
+                    NewFile = P;
+                return true;
+            });
+            if (!NewFile.IsEmpty()) break;
+        }
+        if (NewFile.IsEmpty()) return false;
+        FM.Copy(*DestPath, *NewFile);
+        return true;
+    };
+
+    const FString PerspPath = ShotDir / TEXT("zonegraph_persp.png");
+    const FString TopPath   = ShotDir / TEXT("zonegraph_top.png");
+
+    FrameBox(SceneBox, -45.f, 45.f);
+    const bool bPerspOk = TakeShot(PerspPath);
+
+    FrameBox(SceneBox, -89.9f, 0.f);
+    const bool bTopOk = TakeShot(TopPath);
+
+    // Restore Navigation show flag
+    VC->EngineShowFlags.SetNavigation(bWasNavigation);
+    VC->Invalidate();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), bPerspOk || bTopOk);
+    R->SetStringField(TEXT("perspective"), bPerspOk ? PerspPath : TEXT("(failed)"));
+    R->SetStringField(TEXT("topdown"),     bTopOk   ? TopPath   : TEXT("(failed)"));
     return R;
 }
 
