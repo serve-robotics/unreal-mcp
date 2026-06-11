@@ -170,6 +170,42 @@ with open("/tmp/result.json") as f:
 
 ---
 
+### GIS Commands
+| command | key params | notes |
+|---|---|---|
+| `gis_create_level` | `level_path` (required, e.g. `/Game/Maps/L_Foo`) | creates and opens blank level |
+| `gis_open_level` | `level_path` (required) | opens an existing level |
+| `gis_get_geo_anchor` | — | returns current GeoAnchor EPSG + origin |
+| `gis_set_geo_anchor` | `latitude`, `longitude`, `epsg`; `is_geographic: true` for lon/lat auto-convert | manual anchor placement |
+| `gis_import_landscape` | `dataset_path` (required, elevation raster), `aerial_path` (optional, ortho raster), `meters_per_quad` (optional string, default `"5"`) | async; sets geo anchor from raster geotransform; applies aerial as landscape material when provided |
+| `gis_import_vector_roads` | `dataset_path` (required, .gpkg/.shp), `is_geographic: true` for lon/lat data | async; runs chain-join + carriageway-merge post-passes |
+| `gis_import_opendrive` | `file_path`, `network_name` (optional), `preset_path` (optional) | imports an OpenDRIVE .xodr into an existing ADynamicRoadNetwork |
+| `gis_list_road_networks` | — | lists all ADynamicRoadNetwork actors |
+| `gis_list_road_presets` | — | lists available road preset content paths |
+| `gis_viewer_load_file` | `file_path` | loads a raster or vector layer into the GIS viewer |
+| `gis_viewer_list_layers` | — | returns all loaded layers with type, visibility, shape count |
+| `gis_viewer_clear` | — | removes all layers from the viewer |
+| `gis_focus_landscapes` | — | positions the editor viewport to frame all Landscape actors |
+| `gis_screenshot_markers` | — | takes screenshots at all marker actors in the level |
+
+**`gis_import_landscape` note:** the required param is `dataset_path` (not `raster_path`). Passing the wrong key returns `"gis_import_landscape: dataset_path required"`.
+
+| `vayu_generate_zonegraph` | — | synthesizes pedestrian ZoneShapes from the RoadBLD road network and runs Tempo's ZoneGraph build pipeline |
+
+---
+
+### ZoneGraph — clearing via execute_python
+
+There is no dedicated `vayu_clear_zonegraph` bridge command. The visible ZoneGraph actors are `AZoneShape` (class `/Script/ZoneGraph.ZoneShape`), **not** `AZoneGraphData` — targeting the wrong class will silently destroy nothing. Use `execute_python` to destroy all `ZoneShape` actors:
+
+```json
+{"type": "execute_python", "params": {"script": "import unreal\nworld = unreal.EditorLevelLibrary.get_editor_world()\nzone_shape_class = unreal.load_class(None, '/Script/ZoneGraph.ZoneShape')\nactors = unreal.GameplayStatics.get_all_actors_of_class(world, zone_shape_class)\ncount = len(actors)\nfor a in actors:\n    unreal.EditorLevelLibrary.destroy_actor(a)\nremaining = unreal.GameplayStatics.get_all_actors_of_class(world, zone_shape_class)\nwith open('/tmp/zoneshape_clear.txt', 'w') as f:\n    f.write(f'destroyed={count} remaining={len(remaining)}')"}}
+```
+
+Then `cat /tmp/zoneshape_clear.txt` to confirm count. Verified: destroys all CrowdBLD-generated pedestrian sidewalk and crosswalk ZoneShapes.
+
+---
+
 ## ServeGISTools Plugin
 
 ### GIS MCP Utilities

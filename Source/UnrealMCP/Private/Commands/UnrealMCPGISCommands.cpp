@@ -68,6 +68,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_viewer_clear"))       return HandleViewerClear(Params);
     if (CommandType == TEXT("gis_focus_landscapes"))      return HandleFocusLandscapes(Params);
     if (CommandType == TEXT("gis_screenshot_markers"))    return HandleScreenshotMarkers(Params);
+    if (CommandType == TEXT("vayu_generate_zonegraph"))   return HandleVayuGenerateZoneGraph(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -732,5 +733,121 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotMarkers(
     R->SetNumberField(TEXT("marker_count"), Markers.Num());
     R->SetArrayField(TEXT("markers"), Results);
     return R;
+}
+
+// ---------------------------------------------------------------------------
+// vayu_generate_zonegraph
+//
+// Drives the VayuSim ZoneGraph synthesis subsystem, which authors pedestrian
+// (M1) ZoneShapes from the RoadBLD road network and runs Tempo's build pipeline.
+// The subsystem lives in the VayuSim *game* module; to keep this plugin decoupled
+// from the game module we invoke it reflectively: find the UClass by name, grab
+// the editor-subsystem instance, then ProcessEvent its GenerateTrafficNetwork
+// UFUNCTION and read the returned struct's fields by reflection.
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleVayuGenerateZoneGraph(const TSharedPtr<FJsonObject>& Params)
+{
+    if (!GEditor)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("vayu_generate_zonegraph: GEditor unavailable"));
+
+    // Resolve the subsystem class by name (no compile-time dependency on VayuSim).
+    UClass* SubsystemClass = UClass::TryFindTypeSlow<UClass>(TEXT("VayuZoneGraphSynthesisSubsystem"));
+    if (!SubsystemClass)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("vayu_generate_zonegraph: UVayuZoneGraphSynthesisSubsystem class not found (is the VayuSim editor module loaded?)"));
+
+    UObject* Subsystem = GEditor->GetEditorSubsystemBase(SubsystemClass);
+    if (!Subsystem)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("vayu_generate_zonegraph: could not obtain VayuZoneGraphSynthesisSubsystem instance"));
+
+    UFunction* Fn = Subsystem->FindFunction(FName(TEXT("GenerateTrafficNetwork")));
+    if (!Fn)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("vayu_generate_zonegraph: GenerateTrafficNetwork UFunction not found"));
+
+    // Allocate and zero-init the parameter frame, invoke, then read the return value.
+    void* ParmBuffer = FMemory_Alloca_Aligned(Fn->ParmsSize, Fn->GetMinAlignment());
+    FMemory::Memzero(ParmBuffer, Fn->ParmsSize);
+
+    // Construct any properties that need it (the FVayuZoneGraphSynthesisResult return value
+    // contains a TArray<FString>, so it must be properly constructed before ProcessEvent).
+    for (TFieldIterator<FProperty> It(Fn); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+    {
+        It->InitializeValue_InContainer(ParmBuffer);
+    }
+
+    Subsystem->ProcessEvent(Fn, ParmBuffer);
+
+    // Locate the return value property (the FVayuZoneGraphSynthesisResult struct).
+    FStructProperty* ReturnProp = nullptr;
+    for (TFieldIterator<FProperty> It(Fn); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+    {
+        if (It->HasAnyPropertyFlags(CPF_ReturnParm))
+        {
+            ReturnProp = CastField<FStructProperty>(*It);
+            break;
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    bool bSuccess = false;
+
+    if (ReturnProp)
+    {
+        const void* ResultStruct = ReturnProp->ContainerPtrToValuePtr<void>(ParmBuffer);
+        UScriptStruct* Struct = ReturnProp->Struct;
+
+        auto ReadBool = [&](const TCHAR* Name, bool Default) -> bool
+        {
+            if (FBoolProperty* P = FindFProperty<FBoolProperty>(Struct, FName(Name)))
+                return P->GetPropertyValue_InContainer(ResultStruct);
+            return Default;
+        };
+        auto ReadInt = [&](const TCHAR* Name) -> int32
+        {
+            if (FIntProperty* P = FindFProperty<FIntProperty>(Struct, FName(Name)))
+                return P->GetPropertyValue_InContainer(ResultStruct);
+            return 0;
+        };
+
+        bSuccess = ReadBool(TEXT("bSuccess"), false);
+        Result->SetBoolField(TEXT("zonegraph_built"), bSuccess);
+        Result->SetNumberField(TEXT("road_networks"), ReadInt(TEXT("NumRoadNetworks")));
+        Result->SetNumberField(TEXT("roads"), ReadInt(TEXT("NumRoads")));
+        Result->SetNumberField(TEXT("pedestrian_zoneshapes"), ReadInt(TEXT("NumPedestrianZoneShapes")));
+
+        // Messages array.
+        if (FArrayProperty* MsgArrayProp = FindFProperty<FArrayProperty>(Struct, FName(TEXT("Messages"))))
+        {
+            FScriptArrayHelper Helper(MsgArrayProp, MsgArrayProp->ContainerPtrToValuePtr<void>(ResultStruct));
+            FStrProperty* StrProp = CastField<FStrProperty>(MsgArrayProp->Inner);
+            TArray<TSharedPtr<FJsonValue>> Messages;
+            if (StrProp)
+            {
+                for (int32 i = 0; i < Helper.Num(); ++i)
+                {
+                    const FString Msg = StrProp->GetPropertyValue(Helper.GetRawPtr(i));
+                    Messages.Add(MakeShared<FJsonValueString>(Msg));
+                }
+            }
+            Result->SetArrayField(TEXT("messages"), Messages);
+        }
+    }
+
+    // Destroy the constructed parameter properties to avoid leaking the TArray/FStrings.
+    for (TFieldIterator<FProperty> It(Fn); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+    {
+        It->DestroyValue_InContainer(ParmBuffer);
+    }
+
+    Result->SetBoolField(TEXT("success"), bSuccess);
+    if (!bSuccess)
+    {
+        Result->SetStringField(TEXT("error"),
+            TEXT("vayu_generate_zonegraph: synthesis did not complete (see messages / LogVayuZoneGraph)"));
+    }
+    return Result;
 }
 

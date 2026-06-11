@@ -33,4 +33,8 @@ private:
 
     // Report markers
     TSharedPtr<FJsonObject> HandleScreenshotMarkers(const TSharedPtr<FJsonObject>& Params);
+
+    // Traffic/ZoneGraph synthesis — drives the VayuSim ZoneGraph synthesis subsystem
+    // (in the game module) reflectively so this plugin stays decoupled from VayuSim.
+    TSharedPtr<FJsonObject> HandleVayuGenerateZoneGraph(const TSharedPtr<FJsonObject>& Params);
 };
