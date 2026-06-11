@@ -600,15 +600,50 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleExecutePython(const TSha
 
     const bool bOk = Python->ExecPythonCommandEx(Cmd);
 
+    // Fold the captured log output (every print()/unreal.log() line, tagged
+    // Info/Warning/Error) into the response so callers get stdout directly in
+    // the TCP reply — no temp-file round-trip needed. CommandResult only holds
+    // the eval result (None for ExecuteFile) or the exception trace on failure.
+    FString CapturedOutput;
+    TArray<TSharedPtr<FJsonValue>> LogEntries;
+    for (const FPythonLogOutputEntry& Entry : Cmd.LogOutput)
+    {
+        CapturedOutput += Entry.Output;
+        CapturedOutput += TEXT("\n");
+
+        TSharedPtr<FJsonObject> LogEntryObj = MakeShared<FJsonObject>();
+        LogEntryObj->SetStringField(TEXT("type"), LexToString(Entry.Type));
+        LogEntryObj->SetStringField(TEXT("output"), Entry.Output);
+        LogEntries.Add(MakeShared<FJsonValueObject>(LogEntryObj));
+    }
+    CapturedOutput.TrimEndInline();
+
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetBoolField(TEXT("success"), bOk);
-    if (!Cmd.CommandResult.IsEmpty())
+    if (LogEntries.Num() > 0)
+    {
+        Result->SetArrayField(TEXT("log"), LogEntries);
+    }
+
+    // Prefer captured stdout/log for the human-readable "output" field; fall
+    // back to CommandResult (eval result or, on failure, the exception trace).
+    if (!CapturedOutput.IsEmpty())
+    {
+        Result->SetStringField(TEXT("output"), CapturedOutput);
+    }
+    else if (!Cmd.CommandResult.IsEmpty())
     {
         Result->SetStringField(TEXT("output"), Cmd.CommandResult);
     }
-    if (!bOk && !Cmd.CommandResult.IsEmpty())
+
+    if (!bOk)
     {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(Cmd.CommandResult);
+        // On failure CommandResult carries the exception trace; surface that,
+        // else fall back to whatever Python logged at Error level.
+        const FString ErrMsg = !Cmd.CommandResult.IsEmpty()
+            ? Cmd.CommandResult
+            : (CapturedOutput.IsEmpty() ? TEXT("execute_python: script failed") : CapturedOutput);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrMsg);
     }
     return Result;
 }
