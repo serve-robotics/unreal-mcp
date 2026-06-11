@@ -100,4 +100,17 @@ private:
 	void OnGISVectorRoadsFailed(const FString& ErrorMessage, int32 ErrorCode);
 
 	void StartVectorRoadsImport(const TSharedPtr<FJsonObject>& Params);
+
+	// Async building import state (OSM footprints -> CityBLD modular buildings)
+	TSharedPtr<TPromise<FString>> PendingBuildingsPromise;
+	UServeProcessVectorShapes* PendingBuildingsProc = nullptr;
+	TSharedPtr<FJsonObject> PendingBuildingsParams;
+
+	UFUNCTION()
+	void OnGISBuildingsSucceeded();
+
+	UFUNCTION()
+	void OnGISBuildingsFailed(const FString& ErrorMessage, int32 ErrorCode);
+
+	void StartBuildingsImport(const TSharedPtr<FJsonObject>& Params);
 };

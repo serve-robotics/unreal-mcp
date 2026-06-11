@@ -76,6 +76,7 @@
 #include "DynamicRoad/DynamicRoadNetwork.h"
 #include "Roads/ServeGISRoadStyleTable.h"
 #include "GISViewer/ServeGISRoadImportUtils.h"
+#include "GISViewer/ServeGISBuildingImportUtils.h"
 
 DEFINE_LOG_CATEGORY(LogUnrealMCP);
 
@@ -825,12 +826,251 @@ void UUnrealMCPBridge::StartVectorRoadsImport(const TSharedPtr<FJsonObject>& Par
 }
 
 // ---------------------------------------------------------------------------
+// Async building import (OSM footprint polygons -> CityBLD modular buildings).
+// Mirrors the vector-roads async pattern: load the dataset's shapes off the game
+// thread via UServeProcessVectorShapes, then spawn buildings in the OnSucceeded
+// callback by delegating to the shared FServeGISBuildingImportUtils.
+// ---------------------------------------------------------------------------
+
+void UUnrealMCPBridge::StartBuildingsImport(const TSharedPtr<FJsonObject>& Params)
+{
+    auto FulfillError = [this](const FString& Msg)
+    {
+        TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+        Resp->SetStringField(TEXT("status"), TEXT("error"));
+        Resp->SetStringField(TEXT("error"), Msg);
+        FString Out;
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
+        if (PendingBuildingsPromise.IsValid())
+        {
+            PendingBuildingsPromise->SetValue(Out);
+            PendingBuildingsPromise.Reset();
+        }
+    };
+
+    FString DatasetPath;
+    if (!Params->TryGetStringField(TEXT("dataset_path"), DatasetPath))
+    {
+        FulfillError(TEXT("gis_import_buildings: dataset_path required"));
+        return;
+    }
+
+    bool bSuccess;
+    FString ErrorMsg;
+    UGDALDataset* Dataset = UServeGDALFunctionLibrary::OpenDataset(DatasetPath, /*bReadOnly=*/true, bSuccess, ErrorMsg);
+    if (!bSuccess || !Dataset)
+    {
+        FulfillError(FString::Printf(TEXT("gis_import_buildings: failed to open dataset: %s"), *ErrorMsg));
+        return;
+    }
+
+    UServeProcessVectorShapes* Proc = NewObject<UServeProcessVectorShapes>();
+    Proc->bMergeLineSegments = false; // footprints are polygons; never merge
+
+    // Layer allow-list. Default to the OSM "multipolygons" layer (where building
+    // footprints live); an explicit `layer` param overrides it.
+    FString LayerName = TEXT("multipolygons");
+    Params->TryGetStringField(TEXT("layer"), LayerName);
+    Proc->LayerNameFilter.Add(LayerName);
+
+    PendingBuildingsProc   = Proc;
+    PendingBuildingsParams = Params;
+    Proc->AddToRoot();
+
+    Proc->OnSucceeded.AddDynamic(this, &UUnrealMCPBridge::OnGISBuildingsSucceeded);
+    Proc->OnFailed.AddDynamic(this, &UUnrealMCPBridge::OnGISBuildingsFailed);
+
+    Proc->Run(Dataset);
+}
+
+void UUnrealMCPBridge::OnGISBuildingsSucceeded()
+{
+    auto FulfillError = [this](const FString& Msg)
+    {
+        TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+        Resp->SetStringField(TEXT("status"), TEXT("error"));
+        Resp->SetStringField(TEXT("error"), Msg);
+        FString Out;
+        TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
+        if (PendingBuildingsProc)
+        {
+            PendingBuildingsProc->RemoveFromRoot();
+            PendingBuildingsProc = nullptr;
+        }
+        PendingBuildingsParams.Reset();
+        if (PendingBuildingsPromise.IsValid())
+        {
+            PendingBuildingsPromise->SetValue(Out);
+            PendingBuildingsPromise.Reset();
+        }
+    };
+
+    if (!PendingBuildingsProc)
+    {
+        FulfillError(TEXT("gis_import_buildings: process object lost before callback"));
+        return;
+    }
+
+    const TArray<FGISShapeFeature>& Shapes = PendingBuildingsProc->Shapes;
+    const TSharedPtr<FJsonObject>& Params  = PendingBuildingsParams;
+
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        FulfillError(TEXT("gis_import_buildings: no editor world"));
+        return;
+    }
+
+    AServeGeoAnchor* Anchor = AServeGeoAnchor::FindInWorld(World);
+
+    FServeGISBuildingImportOptions Options;
+
+    // is_geographic: explicit override, else auto-detect from the first point (lon/lat in [-180,180]).
+    if (Params)
+    {
+        bool bGeoOverride = false;
+        if (Params->TryGetBoolField(TEXT("is_geographic"), bGeoOverride))
+        {
+            Options.bIsGeographic = bGeoOverride;
+        }
+        else
+        {
+            for (const FGISShapeFeature& S : Shapes)
+            {
+                if (S.Points.Num() > 0)
+                {
+                    const double X = S.Points[0].X;
+                    Options.bIsGeographic = (X >= -180.0 && X <= 180.0);
+                    break;
+                }
+            }
+        }
+
+        int32 MaxB = 0;
+        if (Params->TryGetNumberField(TEXT("max_buildings"), MaxB) && MaxB > 0)
+        {
+            Options.MaxBuildings = MaxB;
+        }
+
+        FString FbStr;
+        if (Params->TryGetStringField(TEXT("fallback_height"), FbStr))
+        {
+            Options.FallbackHeightMeters = FCString::Atof(*FbStr);
+        }
+    }
+
+    // Optional building style asset path; the shared util resolves it (and falls back to the
+    // bundled default when empty). Kept as a string so the bridge needs no CityBLD dependency.
+    FString StylePath;
+    if (Params && Params->TryGetStringField(TEXT("style_path"), StylePath) && !StylePath.IsEmpty())
+    {
+        Options.StyleAssetPath = StylePath;
+    }
+
+    FServeGISBuildingImportResult ImportResult;
+    FServeGISBuildingImportUtils::SpawnBuildingsFromShapes(World, Shapes, Anchor, Options, ImportResult);
+
+    PendingBuildingsProc->RemoveFromRoot();
+    PendingBuildingsProc = nullptr;
+    PendingBuildingsParams.Reset();
+
+    TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), true);
+    R->SetNumberField(TEXT("buildings_spawned"), ImportResult.Spawned);
+    R->SetNumberField(TEXT("with_osm_height"), ImportResult.WithOSMHeight);
+    R->SetNumberField(TEXT("skipped_non_building"), ImportResult.SkippedNonBld);
+    R->SetNumberField(TEXT("skipped_degenerate"), ImportResult.SkippedDegenerate);
+    R->SetNumberField(TEXT("over_cap"), ImportResult.CappedAt);
+
+    TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+    Resp->SetStringField(TEXT("status"), TEXT("success"));
+    Resp->SetObjectField(TEXT("result"), R);
+
+    FString Out;
+    TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+    FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
+
+    if (PendingBuildingsPromise.IsValid())
+    {
+        PendingBuildingsPromise->SetValue(Out);
+        PendingBuildingsPromise.Reset();
+    }
+}
+
+void UUnrealMCPBridge::OnGISBuildingsFailed(const FString& ErrorMessage, int32 ErrorCode)
+{
+    TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+    Resp->SetStringField(TEXT("status"), TEXT("error"));
+    Resp->SetStringField(TEXT("error"), ErrorMessage);
+
+    FString Out;
+    TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+    FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
+
+    if (PendingBuildingsProc)
+    {
+        PendingBuildingsProc->RemoveFromRoot();
+        PendingBuildingsProc = nullptr;
+    }
+    PendingBuildingsParams.Reset();
+
+    if (PendingBuildingsPromise.IsValid())
+    {
+        PendingBuildingsPromise->SetValue(Out);
+        PendingBuildingsPromise.Reset();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Execute a command received from a client
 // ---------------------------------------------------------------------------
 
 FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TSharedPtr<FJsonObject>& Params)
 {
     UE_LOG(LogUnrealMCP, Log, TEXT(">> cmd=%s"), *CommandType);
+
+    // Async building import (OSM footprints -> CityBLD modular buildings).
+    if (CommandType == TEXT("gis_import_buildings"))
+    {
+        if (PendingBuildingsPromise.IsValid())
+        {
+            TSharedPtr<FJsonObject> Err = MakeShared<FJsonObject>();
+            Err->SetStringField(TEXT("status"), TEXT("error"));
+            Err->SetStringField(TEXT("error"), TEXT("gis_import_buildings: another import is already in progress"));
+            FString Out;
+            TSharedRef<TJsonWriter<>> W2 = TJsonWriterFactory<>::Create(&Out);
+            FJsonSerializer::Serialize(Err.ToSharedRef(), W2);
+            return Out;
+        }
+
+        PendingBuildingsPromise = MakeShared<TPromise<FString>>();
+        TFuture<FString> BFuture = PendingBuildingsPromise->GetFuture();
+
+        AsyncTask(ENamedThreads::GameThread, [this, Params]()
+        {
+            StartBuildingsImport(Params);
+        });
+
+        constexpr float PollSec  = 0.05f;
+        constexpr float LimitSec = 900.f; // hundreds-thousands of modular buildings can be slow
+        for (float Elapsed = 0.f; Elapsed < LimitSec; Elapsed += PollSec)
+        {
+            if (BFuture.IsReady()) return BFuture.Get();
+            FPlatformProcess::Sleep(PollSec);
+        }
+
+        TSharedPtr<FJsonObject> T = MakeShared<FJsonObject>();
+        T->SetStringField(TEXT("status"), TEXT("error"));
+        T->SetStringField(TEXT("error"), TEXT("gis_import_buildings timed out after 900 s"));
+        FString Out;
+        TSharedRef<TJsonWriter<>> W2 = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(T.ToSharedRef(), W2);
+        PendingBuildingsPromise->SetValue(Out);
+        PendingBuildingsPromise.Reset();
+        return Out;
+    }
 
     // Async vector roads import (same promise pattern as landscape).
     if (CommandType == TEXT("gis_import_vector_roads"))
@@ -1087,7 +1327,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_viewer_clear") ||
                      CommandType == TEXT("gis_focus_landscapes") ||
                      CommandType == TEXT("gis_screenshot_markers") ||
-                     CommandType == TEXT("vayu_generate_zonegraph"))
+                     CommandType == TEXT("usim_generate_zonegraph"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);
             }

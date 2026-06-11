@@ -619,7 +619,7 @@ TArray<TSharedPtr<FJsonValue>> FUnrealMCPCLIBridge::BuildToolList()
             {"inflate", "Multiplier applied to the actor's bounds extent for the framing box (default 5)"}
         }, {})));
 
-    Add(MakeTool(TEXT("vayu_generate_zonegraph"),
+    Add(MakeTool(TEXT("usim_generate_zonegraph"),
         TEXT("Synthesize the Tempo traffic ZoneGraph from the imported RoadBLD road network and rebuild it. "
              "Milestone 1: authors pedestrian (sidewalk + crosswalk) ZoneShapes via CrowdBLD over all roads, then "
              "runs Tempo's build pipeline once. Run after gis_import_vector_roads in the level-generation SOP. "

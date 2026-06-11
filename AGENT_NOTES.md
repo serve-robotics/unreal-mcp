@@ -126,6 +126,17 @@ by the other commands — asset editing, data asset population, batch operations
 
 ## Useful Procedures — Update This Section
 
+### `unreal.Rotator` argument order
+Constructor is `(roll, pitch, yaw)` — **not** `(pitch, yaw, roll)`. Passing pitch as the first arg silently sets roll instead, producing a sideways tilt rather than a look-down.
+
+```python
+# Correct — look straight down at 45°
+rot = unreal.Rotator(0.0, -45.0, 0.0)   # roll=0, pitch=-45, yaw=0
+
+# Wrong — tilts the camera 45° to the left
+rot = unreal.Rotator(-45.0, 0.0, 0.0)   # roll=-45, pitch=0, yaw=0
+```
+
 ### Sandbox note — localhost connections
 The Claude Code sandbox blocks localhost TCP by default. All MCP `send_command` calls from
 the host terminal must use `dangerouslyDisableSandbox=true` on the Bash tool call.
@@ -179,6 +190,7 @@ with open("/tmp/result.json") as f:
 | `gis_set_geo_anchor` | `latitude`, `longitude`, `epsg`; `is_geographic: true` for lon/lat auto-convert | manual anchor placement |
 | `gis_import_landscape` | `dataset_path` (required, elevation raster), `aerial_path` (optional, ortho raster), `meters_per_quad` (optional string, default `"5"`) | async; sets geo anchor from raster geotransform; applies aerial as landscape material when provided |
 | `gis_import_vector_roads` | `dataset_path` (required, .gpkg/.shp), `is_geographic: true` for lon/lat data | async; runs chain-join + carriageway-merge post-passes |
+| `gis_import_buildings` | `dataset_path` (required, .gpkg with polygons), `layer` (optional, default `multipolygons`), `is_geographic: true` for lon/lat data, `style_path` (optional UBuildingStyle asset), `max_buildings` (optional int, default 2000), `fallback_height` (optional meters) | async (≤900 s); spawns one CityBLD `AModularBuildingActor` per OSM building footprint, height from OSM `height` tag; delegates to shared `FServeGISBuildingImportUtils` |
 | `gis_import_opendrive` | `file_path`, `network_name` (optional), `preset_path` (optional) | imports an OpenDRIVE .xodr into an existing ADynamicRoadNetwork |
 | `gis_list_road_networks` | — | lists all ADynamicRoadNetwork actors |
 | `gis_list_road_presets` | — | lists available road preset content paths |
@@ -190,7 +202,7 @@ with open("/tmp/result.json") as f:
 
 **`gis_import_landscape` note:** the required param is `dataset_path` (not `raster_path`). Passing the wrong key returns `"gis_import_landscape: dataset_path required"`.
 
-| `vayu_generate_zonegraph` | — | synthesizes pedestrian ZoneShapes from the RoadBLD road network and runs Tempo's ZoneGraph build pipeline |
+| `usim_generate_zonegraph` | — | synthesizes pedestrian ZoneShapes from the RoadBLD road network and runs Tempo's ZoneGraph build pipeline |
 
 ---
 

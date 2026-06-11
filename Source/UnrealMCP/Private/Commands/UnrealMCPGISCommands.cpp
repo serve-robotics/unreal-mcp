@@ -68,7 +68,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_viewer_clear"))       return HandleViewerClear(Params);
     if (CommandType == TEXT("gis_focus_landscapes"))      return HandleFocusLandscapes(Params);
     if (CommandType == TEXT("gis_screenshot_markers"))    return HandleScreenshotMarkers(Params);
-    if (CommandType == TEXT("vayu_generate_zonegraph"))   return HandleVayuGenerateZoneGraph(Params);
+    if (CommandType == TEXT("usim_generate_zonegraph"))   return HandleUSimGenerateZoneGraph(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -736,7 +736,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotMarkers(
 }
 
 // ---------------------------------------------------------------------------
-// vayu_generate_zonegraph
+// usim_generate_zonegraph
 //
 // Drives the VayuSim ZoneGraph synthesis subsystem, which authors pedestrian
 // (M1) ZoneShapes from the RoadBLD road network and runs Tempo's build pipeline.
@@ -746,26 +746,26 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotMarkers(
 // UFUNCTION and read the returned struct's fields by reflection.
 // ---------------------------------------------------------------------------
 
-TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleVayuGenerateZoneGraph(const TSharedPtr<FJsonObject>& Params)
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleUSimGenerateZoneGraph(const TSharedPtr<FJsonObject>& Params)
 {
     if (!GEditor)
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("vayu_generate_zonegraph: GEditor unavailable"));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("usim_generate_zonegraph: GEditor unavailable"));
 
     // Resolve the subsystem class by name (no compile-time dependency on VayuSim).
     UClass* SubsystemClass = UClass::TryFindTypeSlow<UClass>(TEXT("VayuZoneGraphSynthesisSubsystem"));
     if (!SubsystemClass)
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            TEXT("vayu_generate_zonegraph: UVayuZoneGraphSynthesisSubsystem class not found (is the VayuSim editor module loaded?)"));
+            TEXT("usim_generate_zonegraph: UVayuZoneGraphSynthesisSubsystem class not found (is the VayuSim editor module loaded?)"));
 
     UObject* Subsystem = GEditor->GetEditorSubsystemBase(SubsystemClass);
     if (!Subsystem)
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            TEXT("vayu_generate_zonegraph: could not obtain VayuZoneGraphSynthesisSubsystem instance"));
+            TEXT("usim_generate_zonegraph: could not obtain VayuZoneGraphSynthesisSubsystem instance"));
 
     UFunction* Fn = Subsystem->FindFunction(FName(TEXT("GenerateTrafficNetwork")));
     if (!Fn)
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            TEXT("vayu_generate_zonegraph: GenerateTrafficNetwork UFunction not found"));
+            TEXT("usim_generate_zonegraph: GenerateTrafficNetwork UFunction not found"));
 
     // Allocate and zero-init the parameter frame, invoke, then read the return value.
     void* ParmBuffer = FMemory_Alloca_Aligned(Fn->ParmsSize, Fn->GetMinAlignment());
@@ -846,7 +846,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleVayuGenerateZoneGraph(const
     if (!bSuccess)
     {
         Result->SetStringField(TEXT("error"),
-            TEXT("vayu_generate_zonegraph: synthesis did not complete (see messages / LogVayuZoneGraph)"));
+            TEXT("usim_generate_zonegraph: synthesis did not complete (see messages / LogVayuZoneGraph)"));
     }
     return Result;
 }
