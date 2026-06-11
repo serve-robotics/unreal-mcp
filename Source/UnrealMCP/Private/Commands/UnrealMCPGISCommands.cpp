@@ -26,6 +26,7 @@
 // RoadBLD
 #include "DynamicRoad/DynamicRoadNetwork.h"
 #include "DynamicRoad/DynamicRoadData.h"
+#include "DynamicRoad/DynamicRoadIntersection.h"
 
 #include "Engine/Blueprint.h"
 
@@ -894,7 +895,16 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleBuildZoneGraph(const TShare
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             TEXT("gis_build_zone_graph: UTempoRoadLaneGraphSubsystem unavailable — is TempoAgents enabled?"));
 
-    // Step 1: register FTempoZoneGraphBuilder with the ZoneGraph subsystem.
+    // Step 1: spawn one ADynamicRoadIntersection actor per road junction so Tempo's
+    // zone graph builder can generate intersection polygon zones and connect road lanes.
+    int32 IntersectionCount = 0;
+    for (TActorIterator<ADynamicRoadNetwork> It(World); It; ++It)
+    {
+        if (IsValid(*It))
+            IntersectionCount += (*It)->SpawnTempoIntersectionActors(World);
+    }
+
+    // Step 2: register FTempoZoneGraphBuilder with the ZoneGraph subsystem.
     LaneGraphSubsystem->SetupZoneGraphBuilder();
 
     // Count ITempoRoadInterface actors so the caller gets a sanity-check number.
@@ -905,7 +915,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleBuildZoneGraph(const TShare
             ++RoadCount;
     }
 
-    // Step 2: walk all road/intersection actors and attach UZoneShapeComponents.
+    // Step 3: walk all road/intersection actors and attach UZoneShapeComponents.
     if (!LaneGraphSubsystem->TryGenerateZoneShapeComponents())
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(
@@ -914,7 +924,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleBuildZoneGraph(const TShare
                 RoadCount));
     }
 
-    // Step 3: trigger the ZoneGraph rebuild delegate.
+    // Step 4: trigger the ZoneGraph rebuild delegate.
     LaneGraphSubsystem->BuildZoneGraph();
 
     // Count UZoneShapeComponents now attached to actors — definitive proof shapes landed.
@@ -932,9 +942,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleBuildZoneGraph(const TShare
     auto R = MakeShared<FJsonObject>();
     R->SetBoolField(TEXT("success"), true);
     R->SetNumberField(TEXT("road_actor_count"), RoadCount);
+    R->SetNumberField(TEXT("intersection_actor_count"), IntersectionCount);
     R->SetNumberField(TEXT("zone_shape_count"), ZoneShapeCount);
     R->SetStringField(TEXT("message"),
-        FString::Printf(TEXT("Zone graph built: %d road actors, %d zone shapes placed"), RoadCount, ZoneShapeCount));
+        FString::Printf(TEXT("Zone graph built: %d road actors, %d intersection actors, %d zone shapes placed"),
+            RoadCount, IntersectionCount, ZoneShapeCount));
     return R;
 }
 
