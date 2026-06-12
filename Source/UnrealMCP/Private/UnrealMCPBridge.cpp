@@ -1003,8 +1003,40 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         return MakeJsonStr(Resp);
     }
 
+    // gis_set_zone_graph_overlay: enable or disable the Navigation show flag in the active viewport.
+    // {"type":"gis_set_zone_graph_overlay","params":{"enabled":true}}
+    if (CommandType == TEXT("gis_set_zone_graph_overlay"))
+    {
+        bool bEnable = true;
+        Params->TryGetBoolField(TEXT("enabled"), bEnable);
+        TPromise<bool> P; TFuture<bool> F = P.GetFuture();
+        AsyncTask(ENamedThreads::GameThread, [bEnable, P2 = MoveTemp(P)]() mutable {
+            auto& LEM = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+            auto LE = LEM.GetFirstLevelEditor();
+            if (LE) {
+                auto VP = LE->GetActiveViewportInterface();
+                if (VP) {
+                    FLevelEditorViewportClient& VC = VP->GetLevelViewportClient();
+                    VC.EngineShowFlags.SetNavigation(bEnable);
+                    VC.Invalidate();
+                }
+            }
+            P2.SetValue(true);
+        });
+        F.Get();
+        auto R = MakeShared<FJsonObject>();
+        R->SetBoolField(TEXT("success"), true);
+        R->SetBoolField(TEXT("enabled"), bEnable);
+        TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+        Resp->SetStringField(TEXT("status"), TEXT("success"));
+        Resp->SetObjectField(TEXT("result"), R);
+        FString Out; TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
+        return Out;
+    }
+
     // gis_screenshot_zone_graph: enable Navigation show flag (drives ZoneGraph lane rendering),
-    // take perspective + top-down screenshots, then restore the flag.
+    // take perspective + top-down screenshots, then leave the flag ON so zone graph stays visible.
     // Handled here (server thread) so the game thread is free to render while we poll for files.
     if (CommandType == TEXT("gis_screenshot_zone_graph"))
     {
@@ -1051,6 +1083,22 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         });
         FZGContext Ctx = CtxFuture.Get();
         if (!Ctx.Err.IsEmpty()) return ErrZG(Ctx.Err);
+
+        // Optional close-up: override landscape framing with a custom box.
+        // Pass {"location":{"x":...,"y":...,"z":...},"extent":2000} to zoom into a specific area.
+        {
+            const TSharedPtr<FJsonObject>* LocObj;
+            if (Params->TryGetObjectField(TEXT("location"), LocObj) && LocObj)
+            {
+                double X = 0, Y = 0, Z = 0, Ext = 2000;
+                (*LocObj)->TryGetNumberField(TEXT("x"), X);
+                (*LocObj)->TryGetNumberField(TEXT("y"), Y);
+                (*LocObj)->TryGetNumberField(TEXT("z"), Z);
+                Params->TryGetNumberField(TEXT("extent"), Ext);
+                Ctx.Box = FBox(FVector(X - Ext, Y - Ext, Z - Ext * 0.5),
+                               FVector(X + Ext, Y + Ext, Z + Ext * 0.5));
+            }
+        }
 
         // Step 2 — per-shot helper: position camera + fire HighResShot on game thread, poll here.
         const FString ShotDir = FPaths::ConvertRelativePathToFull(FPaths::ScreenShotDir());
@@ -1117,14 +1165,14 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         const bool bPerspOk = TakeZGShot(PerspPath, -45.f,  45.f);
         const bool bTopOk   = TakeZGShot(TopPath,   -89.9f,  0.f);
 
-        // Step 3 — restore Navigation show flag (game thread, fire-and-forget).
-        const bool bWasNav = Ctx.bWasNav;
-        AsyncTask(ENamedThreads::GameThread, [bWasNav]() {
+        // Step 3 — leave Navigation show flag ON so zone graph stays visible in the editor.
+        // (Previously it was restored to the pre-shot state, which turned it off and hid the overlay.)
+        AsyncTask(ENamedThreads::GameThread, []() {
             auto& LEM3 = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
             auto LE3 = LEM3.GetFirstLevelEditor(); if (!LE3) return;
             auto VP3 = LE3->GetActiveViewportInterface(); if (!VP3) return;
             FLevelEditorViewportClient* VC3 = &VP3->GetLevelViewportClient();
-            VC3->EngineShowFlags.SetNavigation(bWasNav);
+            VC3->EngineShowFlags.SetNavigation(true);
             VC3->Invalidate();
         });
 

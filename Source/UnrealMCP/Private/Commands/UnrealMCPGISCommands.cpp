@@ -786,6 +786,18 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotZoneGraph(
     VC->EngineShowFlags.SetNavigation(true);
     VC->Invalidate();
 
+    // Optional close-up: if "location" and "extent" are supplied, frame a custom box instead of the landscape.
+    const TSharedPtr<FJsonObject>* LocObj;
+    if (Params->TryGetObjectField(TEXT("location"), LocObj) && LocObj)
+    {
+        double X = 0, Y = 0, Z = 0, Ext = 2000;
+        (*LocObj)->TryGetNumberField(TEXT("x"), X);
+        (*LocObj)->TryGetNumberField(TEXT("y"), Y);
+        (*LocObj)->TryGetNumberField(TEXT("z"), Z);
+        Params->TryGetNumberField(TEXT("extent"), Ext);
+        SceneBox = FBox(FVector(X - Ext, Y - Ext, Z - Ext*0.5), FVector(X + Ext, Y + Ext, Z + Ext*0.5));
+    }
+
     // Viewport FOV helpers
     const FIntPoint VPSize  = VC->Viewport ? VC->Viewport->GetSizeXY() : FIntPoint(1920, 1080);
     const float Aspect      = VPSize.Y > 0 ? (float)VPSize.X / (float)VPSize.Y : (16.f / 9.f);
@@ -869,6 +881,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotZoneGraph(
     R->SetBoolField(TEXT("success"), bPerspOk || bTopOk);
     R->SetStringField(TEXT("perspective"), bPerspOk ? PerspPath : TEXT("(failed)"));
     R->SetStringField(TEXT("topdown"),     bTopOk   ? TopPath   : TEXT("(failed)"));
+    R->SetStringField(TEXT("framing"),     Params->HasField(TEXT("location")) ? TEXT("closeup") : TEXT("landscape"));
     return R;
 }
 
@@ -895,7 +908,22 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleBuildZoneGraph(const TShare
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             TEXT("gis_build_zone_graph: UTempoRoadLaneGraphSubsystem unavailable — is TempoAgents enabled?"));
 
-    // Step 1: spawn one ADynamicRoadIntersection actor per road junction so Tempo's
+    // Step 1: ensure perimeter cuts are up-to-date on all road networks.
+    // The modern async rebuild (RebuildRoadNetworkIncremental) stores its intersection data
+    // in a temporary FRebuildContext and never writes to the legacy RoadNetworkCorners /
+    // RoadNetworkPerimeterCuts arrays that SpawnTempoIntersectionActors reads.
+    // Calling DetectAndStoreEdgeIntersections populates RoadNetworkCorners from committed
+    // road edge geometry; CreatePerimeterCuts then derives RoadNetworkPerimeterCuts from those.
+    for (TActorIterator<ADynamicRoadNetwork> It(World); It; ++It)
+    {
+        if (IsValid(*It))
+        {
+            (*It)->DetectAndStoreEdgeIntersections();
+            (*It)->CreatePerimeterCuts();
+        }
+    }
+
+    // Step 2: spawn one ADynamicRoadIntersection actor per road junction so Tempo's
     // zone graph builder can generate intersection polygon zones and connect road lanes.
     int32 IntersectionCount = 0;
     for (TActorIterator<ADynamicRoadNetwork> It(World); It; ++It)

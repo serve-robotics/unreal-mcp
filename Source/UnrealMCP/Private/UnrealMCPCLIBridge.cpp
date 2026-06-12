@@ -561,7 +561,7 @@ TArray<TSharedPtr<FJsonValue>> FUnrealMCPCLIBridge::BuildToolList()
         TEXT("Import a raster file (GeoTIFF, etc.) as one or more UE Landscape actors. Async — may take 30-120 s for large tiles."),
         SimpleSchema({
             {"dataset_path",   "Absolute path to the raster file (GeoTIFF, .img, .asc, etc.)"},
-            {"meters_per_quad","Landscape horizontal scale in meters per quad (default 5.0)"},
+            {"meters_per_quad","Landscape horizontal scale in meters per quad (default 1.0)"},
             {"elevation_band", "1-based band index for elevation (default: auto-detect)"},
             {"min_elev",       "Min elevation in meters — if omitted, computed from data"},
             {"max_elev",       "Max elevation in meters — if omitted, computed from data"}
