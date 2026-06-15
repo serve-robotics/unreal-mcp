@@ -969,6 +969,49 @@ void UUnrealMCPBridge::OnGISBuildingsSucceeded()
         Options.StyleAssetPath = StylePath;
     }
 
+    if (Params)
+    {
+        // Optional facade-variety overrides. With none of these set, the shared util applies its
+        // built-in defaults: a tag->style map (apartments/house/retail/...) plus a 15 m tall
+        // threshold and a deterministic per-building seed, so variety works out of the box.
+
+        // style_path_tall: style for buildings above tall_threshold_m with no tag match.
+        FString TallPath;
+        if (Params->TryGetStringField(TEXT("style_path_tall"), TallPath) && !TallPath.IsEmpty())
+        {
+            Options.StyleAssetPath_Tall = TallPath;
+        }
+
+        // tall_threshold_m: height (metres) above which the tall style is used.
+        double TallM = 0.0;
+        if (Params->TryGetNumberField(TEXT("tall_threshold_m"), TallM) && TallM > 0.0)
+        {
+            Options.TallBuildingThresholdCm = static_cast<float>(TallM * 100.0);
+        }
+
+        // seed_per_building: deterministic per-building randomization (default true).
+        bool bSeed = true;
+        if (Params->TryGetBoolField(TEXT("seed_per_building"), bSeed))
+        {
+            Options.bDeterministicSeed = bSeed;
+        }
+
+        // tag_style_map: object mapping lower-cased building= values to style asset paths.
+        // When provided, this fully replaces the built-in tag map.
+        const TSharedPtr<FJsonObject>* TagMapObj = nullptr;
+        if (Params->TryGetObjectField(TEXT("tag_style_map"), TagMapObj) && TagMapObj && TagMapObj->IsValid())
+        {
+            for (const auto& Pair : (*TagMapObj)->Values)
+            {
+                FString PathVal;
+                if (Pair.Value.IsValid() && Pair.Value->TryGetString(PathVal) && !PathVal.IsEmpty())
+                {
+                    Options.TagStyleMap.Add(Pair.Key.ToLower(), PathVal);
+                }
+            }
+        }
+    }
+
     FServeGISBuildingImportResult ImportResult;
     FServeGISBuildingImportUtils::SpawnBuildingsFromShapes(World, Shapes, Anchor, Options, ImportResult);
 
