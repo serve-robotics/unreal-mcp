@@ -1276,7 +1276,12 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_focus_landscapes") ||
                      CommandType == TEXT("gis_screenshot_markers") ||
                      CommandType == TEXT("gis_screenshot_zone_graph") ||
-                     CommandType == TEXT("gis_build_zone_graph"))
+                     CommandType == TEXT("gis_build_zone_graph") ||
+                     CommandType == TEXT("gis_summarize_road_network_semantic") ||
+                     CommandType == TEXT("gis_summarize_lane_graph") ||
+                     CommandType == TEXT("gis_validate_road_network") ||
+                     CommandType == TEXT("gis_reconcile_road_network") ||
+                     CommandType == TEXT("gis_list_report_markers"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);
             }

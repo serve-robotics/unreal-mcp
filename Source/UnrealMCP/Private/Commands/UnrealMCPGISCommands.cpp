@@ -22,6 +22,7 @@
 #include "OpenDRIVE/ServeOpenDRIVEImporter.h"
 #include "GISViewer/ServeGISViewerSubsystem.h"
 #include "GISViewer/GISViewerDataset.h"
+#include "GISViewer/ServeRoadNetworkDiagnostics.h"
 
 // RoadBLD
 #include "DynamicRoad/DynamicRoadNetwork.h"
@@ -74,6 +75,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_screenshot_markers"))    return HandleScreenshotMarkers(Params);
     if (CommandType == TEXT("gis_screenshot_zone_graph")) return HandleScreenshotZoneGraph(Params);
     if (CommandType == TEXT("gis_build_zone_graph"))      return HandleBuildZoneGraph(Params);
+    if (CommandType == TEXT("gis_summarize_road_network_semantic")) return HandleSummarizeRoadNetworkSemantic(Params);
+    if (CommandType == TEXT("gis_summarize_lane_graph"))            return HandleSummarizeLaneGraph(Params);
+    if (CommandType == TEXT("gis_validate_road_network"))           return HandleValidateRoadNetwork(Params);
+    if (CommandType == TEXT("gis_reconcile_road_network"))          return HandleReconcileRoadNetwork(Params);
+    if (CommandType == TEXT("gis_list_report_markers"))             return HandleListReportMarkers(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -975,6 +981,479 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleBuildZoneGraph(const TShare
     R->SetStringField(TEXT("message"),
         FString::Printf(TEXT("Zone graph built: %d road actors, %d intersection actors, %d zone shapes placed"),
             RoadCount, IntersectionCount, ZoneShapeCount));
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// Road-network diagnostics — shared JSON helpers
+// ---------------------------------------------------------------------------
+
+namespace DiagJson
+{
+    static TSharedPtr<FJsonObject> IssueToJson(const FServeRoadDiagIssue& Issue)
+    {
+        static auto SevStr = [](EServeRoadDiagSeverity S) -> FString {
+            switch (S) {
+                case EServeRoadDiagSeverity::Info:    return TEXT("Info");
+                case EServeRoadDiagSeverity::Warning: return TEXT("Warning");
+                case EServeRoadDiagSeverity::Error:   return TEXT("Error");
+            }
+            return TEXT("Unknown");
+        };
+        static auto CatStr = [](EServeRoadDiagCategory C) -> FString {
+            switch (C) {
+                case EServeRoadDiagCategory::Topology:       return TEXT("Topology");
+                case EServeRoadDiagCategory::Geometry:       return TEXT("Geometry");
+                case EServeRoadDiagCategory::Tagging:        return TEXT("Tagging");
+                case EServeRoadDiagCategory::Connectivity:   return TEXT("Connectivity");
+                case EServeRoadDiagCategory::LaneCount:      return TEXT("LaneCount");
+                case EServeRoadDiagCategory::Reconciliation: return TEXT("Reconciliation");
+                case EServeRoadDiagCategory::Subsystem:      return TEXT("Subsystem");
+            }
+            return TEXT("Unknown");
+        };
+
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("severity"),  SevStr(Issue.Severity));
+        J->SetStringField(TEXT("category"),  CatStr(Issue.Category));
+        J->SetStringField(TEXT("message"),   Issue.Message);
+        J->SetStringField(TEXT("entity_id"), Issue.EntityId);
+
+        TArray<TSharedPtr<FJsonValue>> Loc;
+        Loc.Add(MakeShared<FJsonValueNumber>(Issue.Location.X));
+        Loc.Add(MakeShared<FJsonValueNumber>(Issue.Location.Y));
+        Loc.Add(MakeShared<FJsonValueNumber>(Issue.Location.Z));
+        J->SetArrayField(TEXT("location"), Loc);
+        return J;
+    }
+
+    static TSharedPtr<FJsonObject> ReportToJson(const FServeRoadDiagReport& R)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetNumberField(TEXT("errors"),   R.ErrorCount);
+        J->SetNumberField(TEXT("warnings"), R.WarningCount);
+        J->SetNumberField(TEXT("infos"),    R.InfoCount);
+
+        TArray<TSharedPtr<FJsonValue>> IssueArr;
+        for (const FServeRoadDiagIssue& Issue : R.Issues)
+            IssueArr.Add(MakeShared<FJsonValueObject>(IssueToJson(Issue)));
+        J->SetArrayField(TEXT("issues"), IssueArr);
+        return J;
+    }
+
+    static TSharedPtr<FJsonObject> Vec3ToJson(const FVector& V)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetNumberField(TEXT("x"), V.X);
+        J->SetNumberField(TEXT("y"), V.Y);
+        J->SetNumberField(TEXT("z"), V.Z);
+        return J;
+    }
+
+    /** Parse common filter params from command params. */
+    static FServeRoadDiagFilter ParseFilter(const TSharedPtr<FJsonObject>& Params)
+    {
+        FServeRoadDiagFilter F;
+
+        FString NetLabel;
+        if (Params->TryGetStringField(TEXT("network_name"), NetLabel))
+            F.NetworkLabel = NetLabel;
+
+        bool bSummaryOnly = false;
+        if (Params->TryGetBoolField(TEXT("summary_only"), bSummaryOnly))
+            F.bIncludePerEntityArrays = !bSummaryOnly;
+
+        double MaxEnt = 0.0;
+        if (Params->TryGetNumberField(TEXT("max_entities"), MaxEnt))
+            F.MaxEntities = (int32)MaxEnt;
+
+        FString TagStr;
+        if (Params->TryGetStringField(TEXT("tag"), TagStr) && !TagStr.IsEmpty())
+            F.RequiredTag = FName(*TagStr);
+
+        const TSharedPtr<FJsonObject>* BoundsObj = nullptr;
+        if (Params->TryGetObjectField(TEXT("bounds"), BoundsObj) && BoundsObj)
+        {
+            const TSharedPtr<FJsonObject>* MinObj = nullptr;
+            const TSharedPtr<FJsonObject>* MaxObj = nullptr;
+            if ((*BoundsObj)->TryGetObjectField(TEXT("min"), MinObj) &&
+                (*BoundsObj)->TryGetObjectField(TEXT("max"), MaxObj))
+            {
+                double MinX = 0, MinY = 0, MinZ = 0, MaxX = 0, MaxY = 0, MaxZ = 0;
+                (*MinObj)->TryGetNumberField(TEXT("x"), MinX);
+                (*MinObj)->TryGetNumberField(TEXT("y"), MinY);
+                (*MinObj)->TryGetNumberField(TEXT("z"), MinZ);
+                (*MaxObj)->TryGetNumberField(TEXT("x"), MaxX);
+                (*MaxObj)->TryGetNumberField(TEXT("y"), MaxY);
+                (*MaxObj)->TryGetNumberField(TEXT("z"), MaxZ);
+                F.Bounds    = FBox(FVector(MinX, MinY, MinZ), FVector(MaxX, MaxY, MaxZ));
+                F.bHasBounds = true;
+            }
+        }
+
+        return F;
+    }
+} // namespace DiagJson
+
+// ---------------------------------------------------------------------------
+// gis_summarize_road_network_semantic
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSummarizeRoadNetworkSemantic(
+    const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_summarize_road_network_semantic: no editor world"));
+
+    FServeRoadDiagFilter Filter = DiagJson::ParseFilter(Params);
+    FServeSemanticSummary Sum   = FServeRoadNetworkDiagnostics::GatherSemanticSummary(World, Filter);
+    FServeRoadDiagReport  Val   = FServeRoadNetworkDiagnostics::ValidateSemantic(World, Filter);
+
+    bool bSpawnMarkers = true;
+    Params->TryGetBoolField(TEXT("spawn_markers"), bSpawnMarkers);
+    int32 SpawnedCount = 0;
+    if (bSpawnMarkers)
+    {
+        static const FName Tag(TEXT("ServeRoadDiag:Semantic"));
+        FServeRoadNetworkDiagnostics::ClearDiagMarkers(World, Tag);
+        SpawnedCount = FServeRoadNetworkDiagnostics::SpawnDiagMarkers(World, Tag, Val);
+    }
+
+    // --- Build JSON summary block ---
+    auto SumJ = MakeShared<FJsonObject>();
+    SumJ->SetStringField(TEXT("network_label"),              Sum.NetworkLabel);
+    SumJ->SetNumberField(TEXT("road_count"),                 Sum.RoadCount);
+    SumJ->SetNumberField(TEXT("intersection_actor_count"),   Sum.IntersectionActorCount);
+    SumJ->SetNumberField(TEXT("perimeter_cut_count"),        Sum.PerimeterCutCount);
+    SumJ->SetNumberField(TEXT("corner_count"),               Sum.CornerCount);
+    SumJ->SetNumberField(TEXT("intersection_mask_count"),    Sum.IntersectionMaskCount);
+    SumJ->SetNumberField(TEXT("total_road_length_cm"),       Sum.TotalRoadLength);
+    SumJ->SetNumberField(TEXT("sidewalk_road_count"),        Sum.SidewalkRoadCount);
+    SumJ->SetNumberField(TEXT("total_crosswalk_count"),      Sum.TotalCrosswalkCount);
+    SumJ->SetBoolField  (TEXT("intersection_actors_present"), Sum.bIntersectionActorsPresent);
+
+    // Per-entity road array
+    TArray<TSharedPtr<FJsonValue>> RoadsArr;
+    for (const FServeSemRoadInfo& Road : Sum.Roads)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("road_id"),              Road.RoadId);
+        J->SetStringField(TEXT("actor_label"),          Road.ActorLabel);
+        J->SetStringField(TEXT("road_type"),            Road.RoadType);
+        J->SetNumberField(TEXT("length_cm"),            Road.Length);
+        J->SetNumberField(TEXT("left_lane_count"),      Road.LeftLaneCount);
+        J->SetNumberField(TEXT("right_lane_count"),     Road.RightLaneCount);
+        J->SetNumberField(TEXT("navigable_lane_count"), Road.NavigableLaneCount);
+        J->SetBoolField  (TEXT("has_left_sidewalk"),    Road.bHasLeftSidewalk);
+        J->SetBoolField  (TEXT("has_right_sidewalk"),   Road.bHasRightSidewalk);
+        J->SetObjectField(TEXT("start"),                DiagJson::Vec3ToJson(Road.StartLocation));
+        J->SetObjectField(TEXT("end"),                  DiagJson::Vec3ToJson(Road.EndLocation));
+        RoadsArr.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    // Per-entity intersection array
+    TArray<TSharedPtr<FJsonValue>> IntsArr;
+    for (const FServeSemIntersectionInfo& Int : Sum.Intersections)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("intersection_id"),      Int.IntersectionId);
+        J->SetStringField(TEXT("actor_label"),          Int.ActorLabel);
+        J->SetObjectField(TEXT("centroid"),             DiagJson::Vec3ToJson(Int.Centroid));
+        J->SetNumberField(TEXT("approach_count"),       Int.ApproachCount);
+        J->SetNumberField(TEXT("left_turn_pairs"),      Int.LeftTurnPairCount);
+        J->SetNumberField(TEXT("right_turn_pairs"),     Int.RightTurnPairCount);
+        J->SetNumberField(TEXT("through_pairs"),        Int.ThroughPairCount);
+        J->SetNumberField(TEXT("crosswalk_count"),      Int.CrosswalkCount);
+        J->SetNumberField(TEXT("sidewalk_module_count"), Int.SidewalkModuleCount);
+
+        TArray<TSharedPtr<FJsonValue>> ApproachRoads;
+        for (const FString& Id : Int.ApproachRoadIds)
+            ApproachRoads.Add(MakeShared<FJsonValueString>(Id));
+        J->SetArrayField(TEXT("approach_road_ids"), ApproachRoads);
+
+        IntsArr.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),     true);
+    R->SetObjectField(TEXT("summary"),     SumJ);
+    R->SetArrayField (TEXT("roads"),       RoadsArr);
+    R->SetArrayField (TEXT("intersections"), IntsArr);
+    R->SetObjectField(TEXT("validation"),  DiagJson::ReportToJson(Val));
+    R->SetBoolField  (TEXT("markers_spawned"), bSpawnMarkers);
+    R->SetNumberField(TEXT("marker_count"),    SpawnedCount);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_summarize_lane_graph
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSummarizeLaneGraph(
+    const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_summarize_lane_graph: no editor world"));
+
+    FServeRoadDiagFilter Filter = DiagJson::ParseFilter(Params);
+    FServeZoneGraphSummary Sum  = FServeRoadNetworkDiagnostics::GatherZoneGraphSummary(World, Filter);
+    FServeRoadDiagReport   Val  = FServeRoadNetworkDiagnostics::ValidateZoneGraph(World, Filter);
+
+    bool bSpawnMarkers = false; // summary commands default off
+    Params->TryGetBoolField(TEXT("spawn_markers"), bSpawnMarkers);
+    int32 SpawnedCount = 0;
+    if (bSpawnMarkers)
+    {
+        static const FName Tag(TEXT("ServeRoadDiag:ZoneGraph"));
+        FServeRoadNetworkDiagnostics::ClearDiagMarkers(World, Tag);
+        SpawnedCount = FServeRoadNetworkDiagnostics::SpawnDiagMarkers(World, Tag, Val);
+    }
+
+    // Connectivity block
+    auto ConnJ = MakeShared<FJsonObject>();
+    ConnJ->SetNumberField(TEXT("component_count"),            Sum.Connectivity.ComponentCount);
+    ConnJ->SetNumberField(TEXT("largest_component_lane_count"), Sum.Connectivity.LargestComponentLaneCount);
+    ConnJ->SetNumberField(TEXT("driving_component_count"),    Sum.Connectivity.DrivingComponentCount);
+
+    TArray<TSharedPtr<FJsonValue>> CompArr;
+    for (const FServeZGComponent& C : Sum.Connectivity.Components)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetNumberField(TEXT("component_id"),         C.ComponentId);
+        J->SetNumberField(TEXT("lane_count"),           C.LaneCount);
+        J->SetNumberField(TEXT("driving_lane_count"),   C.DrivingLaneCount);
+        J->SetObjectField(TEXT("representative_point"), DiagJson::Vec3ToJson(C.RepresentativePoint));
+        CompArr.Add(MakeShared<FJsonValueObject>(J));
+    }
+    ConnJ->SetArrayField(TEXT("components"), CompArr);
+
+    // Summary block
+    auto SumJ = MakeShared<FJsonObject>();
+    SumJ->SetBoolField  (TEXT("subsystem_present"),       Sum.bSubsystemPresent);
+    SumJ->SetBoolField  (TEXT("data_registered"),         Sum.bDataRegistered);
+    SumJ->SetNumberField(TEXT("registered_data_count"),   Sum.RegisteredDataCount);
+    SumJ->SetNumberField(TEXT("zone_count"),              Sum.ZoneCount);
+    SumJ->SetNumberField(TEXT("lane_count"),              Sum.LaneCount);
+    SumJ->SetNumberField(TEXT("lane_link_count"),         Sum.LaneLinkCount);
+    SumJ->SetNumberField(TEXT("intersection_zone_count"), Sum.IntersectionZoneCount);
+    SumJ->SetNumberField(TEXT("driving_lane_count"),      Sum.DrivingLaneCount);
+    SumJ->SetNumberField(TEXT("walkable_lane_count"),     Sum.WalkableLaneCount);
+    SumJ->SetNumberField(TEXT("crosswalk_lane_count"),    Sum.CrosswalkLaneCount);
+    SumJ->SetNumberField(TEXT("isolated_lane_count"),     Sum.IsolatedLaneCount);
+    SumJ->SetNumberField(TEXT("total_lane_length_cm"),    Sum.TotalLaneLength);
+
+    // Per-entity zone array
+    TArray<TSharedPtr<FJsonValue>> ZonesArr;
+    for (const FServeZGZoneInfo& Z : Sum.Zones)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetNumberField(TEXT("zone_index"),     Z.ZoneIndex);
+        J->SetStringField(TEXT("zone_id"),        Z.ZoneId);
+        J->SetBoolField  (TEXT("is_intersection"), Z.bIsIntersection);
+        J->SetNumberField(TEXT("lane_count"),     Z.LaneCount);
+        TArray<TSharedPtr<FJsonValue>> TagArr;
+        for (const FString& T : Z.Tags) TagArr.Add(MakeShared<FJsonValueString>(T));
+        J->SetArrayField (TEXT("tags"), TagArr);
+        ZonesArr.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    // Per-entity lane array
+    TArray<TSharedPtr<FJsonValue>> LanesArr;
+    for (const FServeZGLaneInfo& L : Sum.Lanes)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetNumberField(TEXT("lane_index"),     L.LaneIndex);
+        J->SetStringField(TEXT("lane_id"),        L.LaneId);
+        J->SetNumberField(TEXT("zone_index"),     L.ZoneIndex);
+        J->SetNumberField(TEXT("width"),          L.Width);
+        J->SetNumberField(TEXT("length_cm"),      L.Length);
+        J->SetNumberField(TEXT("outgoing"),       L.OutgoingCount);
+        J->SetNumberField(TEXT("incoming"),       L.IncomingCount);
+        J->SetNumberField(TEXT("adjacent"),       L.AdjacentCount);
+        J->SetNumberField(TEXT("component_id"),   L.ComponentId);
+        J->SetObjectField(TEXT("start"),          DiagJson::Vec3ToJson(L.StartPoint));
+        J->SetObjectField(TEXT("end"),            DiagJson::Vec3ToJson(L.EndPoint));
+
+        TArray<TSharedPtr<FJsonValue>> TagArr;
+        for (const FString& T : L.Tags) TagArr.Add(MakeShared<FJsonValueString>(T));
+        J->SetArrayField(TEXT("tags"), TagArr);
+
+        TArray<TSharedPtr<FJsonValue>> OutArr;
+        for (int32 D : L.OutgoingDestLanes) OutArr.Add(MakeShared<FJsonValueNumber>(D));
+        J->SetArrayField(TEXT("outgoing_dest_lanes"), OutArr);
+
+        LanesArr.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),      true);
+    R->SetObjectField(TEXT("summary"),      SumJ);
+    R->SetObjectField(TEXT("connectivity"), ConnJ);
+    R->SetArrayField (TEXT("zones"),        ZonesArr);
+    R->SetArrayField (TEXT("lanes"),        LanesArr);
+    R->SetObjectField(TEXT("validation"),   DiagJson::ReportToJson(Val));
+    R->SetBoolField  (TEXT("markers_spawned"), bSpawnMarkers);
+    R->SetNumberField(TEXT("marker_count"),    SpawnedCount);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_validate_road_network
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleValidateRoadNetwork(
+    const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_validate_road_network: no editor world"));
+
+    FServeRoadDiagFilter Filter = DiagJson::ParseFilter(Params);
+
+    FServeRoadDiagReport SemVal  = FServeRoadNetworkDiagnostics::ValidateSemantic(World, Filter);
+    FServeRoadDiagReport ZGVal   = FServeRoadNetworkDiagnostics::ValidateZoneGraph(World, Filter);
+    FServeRoadDiagReport CWVal   = FServeRoadNetworkDiagnostics::ValidateCrosswalkConnectivity(World, Filter);
+    FServeRoadDiagReport IntVal  = FServeRoadNetworkDiagnostics::ValidateIntersectionSelfContainment(World, Filter);
+
+    bool bSpawnMarkers = true;
+    Params->TryGetBoolField(TEXT("spawn_markers"), bSpawnMarkers);
+
+    int32 TotalSpawned = 0;
+    if (bSpawnMarkers)
+    {
+        auto Spawn = [&](FName Tag, const FServeRoadDiagReport& Rep) {
+            FServeRoadNetworkDiagnostics::ClearDiagMarkers(World, Tag);
+            TotalSpawned += FServeRoadNetworkDiagnostics::SpawnDiagMarkers(World, Tag, Rep);
+        };
+        Spawn(FName(TEXT("ServeRoadDiag:Semantic")),     SemVal);
+        Spawn(FName(TEXT("ServeRoadDiag:ZoneGraph")),    ZGVal);
+        Spawn(FName(TEXT("ServeRoadDiag:Crosswalk")),    CWVal);
+        Spawn(FName(TEXT("ServeRoadDiag:Intersection")), IntVal);
+    }
+
+    const bool bPassed = (SemVal.ErrorCount + ZGVal.ErrorCount +
+                          CWVal.ErrorCount + IntVal.ErrorCount) == 0;
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),                true);
+    R->SetBoolField  (TEXT("passed"),                 bPassed);
+    R->SetObjectField(TEXT("semantic_validation"),    DiagJson::ReportToJson(SemVal));
+    R->SetObjectField(TEXT("zonegraph_validation"),   DiagJson::ReportToJson(ZGVal));
+    R->SetObjectField(TEXT("crosswalk_validation"),   DiagJson::ReportToJson(CWVal));
+    R->SetObjectField(TEXT("intersection_validation"), DiagJson::ReportToJson(IntVal));
+    R->SetBoolField  (TEXT("markers_spawned"),        bSpawnMarkers);
+    R->SetNumberField(TEXT("marker_count"),           TotalSpawned);
+
+    TArray<TSharedPtr<FJsonValue>> MarkerTagsArr;
+    if (bSpawnMarkers)
+    {
+        for (const TCHAR* T : { TEXT("ServeRoadDiag:Semantic"), TEXT("ServeRoadDiag:ZoneGraph"),
+                                 TEXT("ServeRoadDiag:Crosswalk"), TEXT("ServeRoadDiag:Intersection") })
+            MarkerTagsArr.Add(MakeShared<FJsonValueString>(T));
+    }
+    R->SetArrayField(TEXT("marker_tags"), MarkerTagsArr);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_reconcile_road_network
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleReconcileRoadNetwork(
+    const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_reconcile_road_network: no editor world"));
+
+    FServeRoadDiagFilter Filter = DiagJson::ParseFilter(Params);
+
+    double SnapDist = 5000.0;
+    Params->TryGetNumberField(TEXT("snap_distance_cm"), SnapDist);
+
+    FServeReconcileSummary Rec = FServeRoadNetworkDiagnostics::Reconcile(World, Filter, SnapDist);
+
+    bool bSpawnMarkers = true;
+    Params->TryGetBoolField(TEXT("spawn_markers"), bSpawnMarkers);
+    int32 SpawnedCount = 0;
+    if (bSpawnMarkers)
+    {
+        static const FName Tag(TEXT("ServeRoadDiag:Reconcile"));
+        FServeRoadNetworkDiagnostics::ClearDiagMarkers(World, Tag);
+        SpawnedCount = FServeRoadNetworkDiagnostics::SpawnDiagMarkers(World, Tag, Rec.Report);
+    }
+
+    auto CountsJ = MakeShared<FJsonObject>();
+    CountsJ->SetNumberField(TEXT("semantic_roads"),             Rec.SemanticRoadCount);
+    CountsJ->SetNumberField(TEXT("semantic_intersections"),     Rec.SemanticIntersectionCount);
+    CountsJ->SetNumberField(TEXT("zg_zones"),                   Rec.ZGZoneCount);
+    CountsJ->SetNumberField(TEXT("zg_intersection_zones"),      Rec.ZGIntersectionZoneCount);
+    CountsJ->SetNumberField(TEXT("roads_with_zero_lanes"),      Rec.RoadsWithZeroLanes);
+    CountsJ->SetNumberField(TEXT("intersections_without_zone"), Rec.IntersectionsWithoutZone);
+    CountsJ->SetNumberField(TEXT("orphan_intersection_zones"),  Rec.OrphanIntersectionZones);
+
+    const bool bPassed = (Rec.Report.ErrorCount == 0);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),              true);
+    R->SetBoolField  (TEXT("passed"),               bPassed);
+    R->SetObjectField(TEXT("counts"),               CountsJ);
+    R->SetBoolField  (TEXT("reverse_map_available"), Rec.bReverseMapAvailable);
+    R->SetNumberField(TEXT("snap_distance_cm"),     Rec.SnapDistanceCm);
+    R->SetObjectField(TEXT("report"),               DiagJson::ReportToJson(Rec.Report));
+    R->SetBoolField  (TEXT("markers_spawned"),      bSpawnMarkers);
+    R->SetNumberField(TEXT("marker_count"),         SpawnedCount);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_list_report_markers
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListReportMarkers(
+    const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_list_report_markers: no editor world"));
+
+    FName TagFilter = NAME_None;
+    FString TagStr;
+    if (Params->TryGetStringField(TEXT("tag"), TagStr) && !TagStr.IsEmpty())
+        TagFilter = FName(*TagStr);
+
+    TArray<FServeReportMarkerInfo> Markers =
+        FServeRoadNetworkDiagnostics::GatherReportMarkers(World, TagFilter);
+
+    TArray<TSharedPtr<FJsonValue>> MarkerArr;
+    for (const FServeReportMarkerInfo& M : Markers)
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("actor"),       M.ActorLabel);
+        J->SetStringField(TEXT("text"),        M.Text);
+        J->SetObjectField(TEXT("location"),    DiagJson::Vec3ToJson(M.Location));
+        J->SetBoolField  (TEXT("has_lat_lon"), M.bHasLatLon);
+        J->SetNumberField(TEXT("lat"),         M.Lat);
+        J->SetNumberField(TEXT("lon"),         M.Lon);
+
+        TArray<TSharedPtr<FJsonValue>> TagArr;
+        for (const FString& T : M.Tags) TagArr.Add(MakeShared<FJsonValueString>(T));
+        J->SetArrayField(TEXT("tags"), TagArr);
+
+        MarkerArr.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),      true);
+    R->SetNumberField(TEXT("marker_count"), Markers.Num());
+    R->SetArrayField (TEXT("markers"),      MarkerArr);
     return R;
 }
 
