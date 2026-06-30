@@ -34,6 +34,16 @@ private:
     // Report markers
     TSharedPtr<FJsonObject> HandleScreenshotMarkers(const TSharedPtr<FJsonObject>& Params);
 
+    // Zone graph visualization screenshots
+    TSharedPtr<FJsonObject> HandleScreenshotZoneGraph(const TSharedPtr<FJsonObject>& Params);
+
     // Tempo zone graph pipeline
     TSharedPtr<FJsonObject> HandleBuildZoneGraph(const TSharedPtr<FJsonObject>& Params);
+
+    // Road-network diagnostics
+    TSharedPtr<FJsonObject> HandleSummarizeRoadNetworkSemantic(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSummarizeLaneGraph(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleValidateRoadNetwork(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleReconcileRoadNetwork(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleListReportMarkers(const TSharedPtr<FJsonObject>& Params);
 };
