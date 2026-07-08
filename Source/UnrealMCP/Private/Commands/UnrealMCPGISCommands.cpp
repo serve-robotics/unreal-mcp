@@ -89,6 +89,12 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
 // gis_create_level
 // ---------------------------------------------------------------------------
 
+// Built-in Open World template: WorldPartition + landscape + sky/lighting already configured. New
+// towns clone this so roads have terrain to snap to and each town is a fully self-contained level —
+// which also gives procedural generation a guaranteed-total reset (a fresh level, not an in-place
+// sweep that can miss ZoneGraph/intersection/block actors).
+static const TCHAR* kDefaultLevelTemplate = TEXT("/Engine/Maps/Templates/OpenWorld");
+
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPtr<FJsonObject>& Params)
 {
     FString LevelPath;
@@ -99,13 +105,66 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
     if (!LES)
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_create_level: LevelEditorSubsystem unavailable"));
 
-    if (!LES->NewLevel(LevelPath))
+    // Optional template. Defaults to the Open World template so a new level ships with landscape +
+    // lighting. Pass template_path:"" (empty) to explicitly request a truly blank level instead.
+    FString TemplatePath = kDefaultLevelTemplate;
+    Params->TryGetStringField(TEXT("template_path"), TemplatePath);
+
+    // NewLevel/NewLevelFromTemplate refuse to overwrite an existing asset ("Failed to validate the
+    // destination"). For regenerate-to-a-fixed-name workflows, pass overwrite:true to delete the
+    // existing level first. (Default false so a typo can't silently nuke a level.)
+    bool bOverwrite = false;
+    Params->TryGetBoolField(TEXT("overwrite"), bOverwrite);
+    bool bDeletedExisting = false;
+    if (UEditorAssetLibrary::DoesAssetExist(LevelPath))
+    {
+        if (!bOverwrite)
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("gis_create_level: '%s' already exists (pass overwrite:true to replace it)"), *LevelPath));
+
+        // DeleteAsset fails if the target level's package is still referenced — most commonly because
+        // it's the currently-open world (a regenerate-to-a-fixed-name run reuses the same path). Move
+        // off it onto a throwaway blank level FIRST so nothing holds the package open, then delete.
+        // NewLevel("") creates an unsaved /Temp map (same as File > New Level), releasing the target.
+        if (UWorld* CurrentWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+        {
+            const FString CurrentPkg = CurrentWorld->GetOutermost()->GetName();
+            const FString TargetPkg = FPackageName::ObjectPathToPackageName(LevelPath);
+            if (CurrentPkg == TargetPkg)
+            {
+                LES->NewLevel(TEXT(""));
+            }
+        }
+
+        if (!UEditorAssetLibrary::DeleteAsset(LevelPath))
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("gis_create_level: failed to delete existing '%s' for overwrite "
+                                     "(package may still be loaded/referenced)"), *LevelPath));
+        bDeletedExisting = true;
+    }
+
+    bool bOk;
+    if (TemplatePath.IsEmpty())
+    {
+        bOk = LES->NewLevel(LevelPath);
+    }
+    else
+    {
+        bOk = LES->NewLevelFromTemplate(LevelPath, TemplatePath);
+    }
+
+    if (!bOk)
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            FString::Printf(TEXT("gis_create_level: failed to create '%s'"), *LevelPath));
+            FString::Printf(TEXT("gis_create_level: failed to create '%s'%s"),
+                *LevelPath,
+                TemplatePath.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" from template '%s'"), *TemplatePath)));
 
     auto R = MakeShared<FJsonObject>();
     R->SetBoolField(TEXT("success"), true);
     R->SetStringField(TEXT("level_path"), LevelPath);
+    if (!TemplatePath.IsEmpty())
+        R->SetStringField(TEXT("template_path"), TemplatePath);
+    R->SetBoolField(TEXT("overwrote_existing"), bDeletedExisting);
     return R;
 }
 
