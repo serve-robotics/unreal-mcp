@@ -1386,7 +1386,8 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_list_districts") ||
                      CommandType == TEXT("gis_generate_block_shapes") ||
                      CommandType == TEXT("gis_assign_district") ||
-                     CommandType == TEXT("gis_generate_buildings"))
+                     CommandType == TEXT("gis_generate_buildings") ||
+                     CommandType == TEXT("gis_generate_procedural_roads"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);
             }

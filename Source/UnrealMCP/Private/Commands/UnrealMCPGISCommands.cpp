@@ -1,6 +1,7 @@
 #include "Commands/UnrealMCPGISCommands.h"
 #include "Commands/UnrealMCPCommonUtils.h"
 #include "CityGenerationUtils.h"
+#include "ProceduralRoadGen.h"
 
 #include "Editor.h"
 #include "TempoRoadLaneGraphSubsystem.h"
@@ -87,6 +88,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_generate_block_shapes")) return HandleGenerateBlockShapes(Params);
     if (CommandType == TEXT("gis_assign_district"))      return HandleAssignDistrict(Params);
     if (CommandType == TEXT("gis_generate_buildings"))   return HandleGenerateBuildings(Params);
+    if (CommandType == TEXT("gis_generate_procedural_roads")) return HandleGenerateProceduralRoads(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -1562,6 +1564,41 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateBuildings(const TSh
     R->SetBoolField  (TEXT("success"),           true);
     R->SetNumberField(TEXT("blocks_generated"),  Generated);
     R->SetNumberField(TEXT("blocks_skipped"),    Skipped);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_generate_procedural_roads
+// Params: seed (int, optional, default 42)
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_generate_procedural_roads: no editor world available"));
+
+    int32 Seed = 42;
+    if (Params.IsValid())
+    {
+        double SeedD = 42.0;
+        if (Params->TryGetNumberField(TEXT("seed"), SeedD))
+            Seed = static_cast<int32>(SeedD);
+    }
+
+    FString Message;
+    FProceduralRoadGen::Generate(World, Seed, Message);
+
+    // Generate sets an error-like message when it aborts early (starts with "No ").
+    if (Message.StartsWith(TEXT("No ")) || Message.StartsWith(TEXT("Failed")))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_procedural_roads: %s"), *Message));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"), true);
+    R->SetStringField(TEXT("message"), Message);
+    R->SetNumberField(TEXT("seed"),    Seed);
     return R;
 }
 
