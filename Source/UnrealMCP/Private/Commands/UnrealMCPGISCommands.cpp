@@ -1,5 +1,6 @@
 #include "Commands/UnrealMCPGISCommands.h"
 #include "Commands/UnrealMCPCommonUtils.h"
+#include "CityGenerationUtils.h"
 
 #include "Editor.h"
 #include "TempoRoadLaneGraphSubsystem.h"
@@ -80,6 +81,12 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_validate_road_network"))           return HandleValidateRoadNetwork(Params);
     if (CommandType == TEXT("gis_reconcile_road_network"))          return HandleReconcileRoadNetwork(Params);
     if (CommandType == TEXT("gis_list_report_markers"))             return HandleListReportMarkers(Params);
+
+    // City block and building generation
+    if (CommandType == TEXT("gis_list_districts"))       return HandleListDistricts(Params);
+    if (CommandType == TEXT("gis_generate_block_shapes")) return HandleGenerateBlockShapes(Params);
+    if (CommandType == TEXT("gis_assign_district"))      return HandleAssignDistrict(Params);
+    if (CommandType == TEXT("gis_generate_buildings"))   return HandleGenerateBuildings(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -1454,6 +1461,107 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListReportMarkers(
     R->SetBoolField  (TEXT("success"),      true);
     R->SetNumberField(TEXT("marker_count"), Markers.Num());
     R->SetArrayField (TEXT("markers"),      MarkerArr);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_list_districts
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListDistricts(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    TArray<TSharedPtr<FJsonValue>> DistrictArr;
+    for (const FCityGenerationUtils::FDistrictInfo& Info : FCityGenerationUtils::ListDistricts())
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"),       Info.DisplayName);
+        J->SetStringField(TEXT("class_name"), Info.ClassName);
+        DistrictArr.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),        true);
+    R->SetNumberField(TEXT("district_count"), DistrictArr.Num());
+    R->SetArrayField (TEXT("districts"),      DistrictArr);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_generate_block_shapes
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateBlockShapes(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_generate_block_shapes: no editor world available"));
+
+    FString Error;
+    if (!FCityGenerationUtils::GenerateBlockShapes(World, Error))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_block_shapes: %s"), *Error));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"), true);
+    R->SetStringField(TEXT("message"), TEXT("Block shapes generated"));
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_assign_district
+// Params: district (string — display name or class name, required)
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleAssignDistrict(const TSharedPtr<FJsonObject>& Params)
+{
+    FString DistrictName;
+    if (!Params->TryGetStringField(TEXT("district"), DistrictName) || DistrictName.IsEmpty())
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_assign_district: 'district' param required (display name or class name). "
+                 "Use gis_list_districts to see available values."));
+
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_assign_district: no editor world available"));
+
+    FString Error;
+    UClass* DistrictClass = FCityGenerationUtils::FindDistrictClass(DistrictName, Error);
+    if (!DistrictClass)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_assign_district: %s"), *Error));
+
+    int32 Count = 0;
+    if (!FCityGenerationUtils::AssignDistrictToAllBlocks(World, DistrictClass, Count, Error))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_assign_district: %s"), *Error));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),        true);
+    R->SetStringField(TEXT("district"),       DistrictName);
+    R->SetNumberField(TEXT("blocks_assigned"), Count);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_generate_buildings
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateBuildings(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_generate_buildings: no editor world available"));
+
+    int32 Generated = 0, Skipped = 0;
+    FString Error;
+    if (!FCityGenerationUtils::GenerateBuildingsForAllBlocks(World, Generated, Skipped, Error))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_buildings: %s"), *Error));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),           true);
+    R->SetNumberField(TEXT("blocks_generated"),  Generated);
+    R->SetNumberField(TEXT("blocks_skipped"),    Skipped);
     return R;
 }
 

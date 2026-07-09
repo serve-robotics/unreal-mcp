@@ -46,4 +46,10 @@ private:
     TSharedPtr<FJsonObject> HandleValidateRoadNetwork(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleReconcileRoadNetwork(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleListReportMarkers(const TSharedPtr<FJsonObject>& Params);
+
+    // City block and building generation (FCityGenerationUtils)
+    TSharedPtr<FJsonObject> HandleListDistricts(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleGenerateBlockShapes(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleAssignDistrict(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleGenerateBuildings(const TSharedPtr<FJsonObject>& Params);
 };

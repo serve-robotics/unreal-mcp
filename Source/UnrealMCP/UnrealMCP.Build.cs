@@ -65,6 +65,7 @@ public class UnrealMCP : ModuleRules
 				"TempoAgentsEditor",
 				"TempoAgents",
 				"ZoneGraph",
+				// City block / building generation (FCityGenerationUtils — now in ServeGISToolsEditor)
 			}
 		);
 

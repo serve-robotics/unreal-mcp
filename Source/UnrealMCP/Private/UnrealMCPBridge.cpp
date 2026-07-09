@@ -77,8 +77,10 @@
 // RoadBLD — for road creation from vector shapes
 #include "DynamicRoad/DynamicRoad.h"
 #include "DynamicRoad/DynamicRoadNetwork.h"
+#include "RoadGeo.h"
 #include "Roads/ServeGISRoadStyleTable.h"
 #include "GISViewer/ServeGISRoadImportUtils.h"
+#include "Containers/Ticker.h"
 
 DEFINE_LOG_CATEGORY(LogUnrealMCP);
 
@@ -727,8 +729,6 @@ void UUnrealMCPBridge::OnGISVectorRoadsSucceeded()
     int32 Spawned = 0;
     for (const FServeGISRoadEntry& Info : SpawnedRoads) { if (IsValid(Info.Road)) { ++Spawned; } }
 
-    Network->RebuildRoadNetworkIncremental({}, {}, false);
-
     PendingVectorRoadsProc->RemoveFromRoot();
     PendingVectorRoadsProc = nullptr;
     PendingVectorRoadsParams.Reset();
@@ -745,6 +745,12 @@ void UUnrealMCPBridge::OnGISVectorRoadsSucceeded()
     FString Out;
     TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
     FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
+
+    // Kick off the road mesh rebuild and return immediately. Callers that need road
+    // meshes and collision before proceeding (e.g. gis_generate_block_shapes) should
+    // first call gis_rebuild_road_networks, which polls via PollRoadRebuildComplete
+    // until RoadGeo actor count has stabilised (rebuild commit finished).
+    Network->RebuildRoadNetworkIncremental({}, {}, false);
 
     if (PendingVectorRoadsPromise.IsValid())
     {
@@ -775,6 +781,38 @@ void UUnrealMCPBridge::OnGISVectorRoadsFailed(const FString& ErrorMessage, int32
         PendingVectorRoadsPromise->SetValue(Out);
         PendingVectorRoadsPromise.Reset();
     }
+}
+
+bool UUnrealMCPBridge::PollRoadRebuildComplete(float /*DeltaTime*/)
+{
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World) return true; // keep ticking
+
+    TArray<AActor*> GeoActors;
+    UGameplayStatics::GetAllActorsOfClass(World, ARoadGeo::StaticClass(), GeoActors);
+    const int32 CurrentCount = GeoActors.Num();
+
+    if (CurrentCount > 0 && CurrentCount == LastRoadGeoCount)
+    {
+        RoadGeoStableFrames++;
+        if (RoadGeoStableFrames >= 3) // stable for 3 consecutive 1-second ticks
+        {
+            if (PendingVectorRoadsPromise.IsValid())
+            {
+                PendingVectorRoadsPromise->SetValue(PendingVectorRoadsResult);
+                PendingVectorRoadsPromise.Reset();
+            }
+            PendingVectorRoadsResult.Empty();
+            RoadRebuildTickerHandle.Reset();
+            return false; // stop ticking
+        }
+    }
+    else
+    {
+        RoadGeoStableFrames = 0;
+    }
+    LastRoadGeoCount = CurrentCount;
+    return true; // keep ticking
 }
 
 void UUnrealMCPBridge::StartVectorRoadsImport(const TSharedPtr<FJsonObject>& Params)
@@ -916,6 +954,69 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         PendingGISPromise->SetValue(Out);
         PendingGISPromise.Reset();
         return Out;
+    }
+
+    // gis_rebuild_road_networks: wait for the in-progress road rebuild commit to finish.
+    // gis_import_vector_roads triggers a rebuild and returns immediately — call this
+    // before gis_generate_block_shapes to ensure RoadGeo actors (with collision) exist.
+    // Polls every 1 s until RoadGeo count has been stable for 3 consecutive readings.
+    if (CommandType == TEXT("gis_rebuild_road_networks"))
+    {
+        if (PendingVectorRoadsPromise.IsValid())
+        {
+            TSharedPtr<FJsonObject> Err = MakeShared<FJsonObject>();
+            Err->SetStringField(TEXT("status"), TEXT("error"));
+            Err->SetStringField(TEXT("error"), TEXT("gis_rebuild_road_networks: road import or rebuild already in progress"));
+            FString Out;
+            TSharedRef<TJsonWriter<>> W2 = TJsonWriterFactory<>::Create(&Out);
+            FJsonSerializer::Serialize(Err.ToSharedRef(), W2);
+            return Out;
+        }
+
+        PendingVectorRoadsPromise = MakeShared<TPromise<FString>>();
+        TFuture<FString> RebuildFuture = PendingVectorRoadsPromise->GetFuture();
+
+        // Build success result upfront; PollRoadRebuildComplete delivers it when stable.
+        TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+        R->SetBoolField(TEXT("success"), true);
+        TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+        Resp->SetStringField(TEXT("status"), TEXT("success"));
+        Resp->SetObjectField(TEXT("result"), R);
+        FString SuccessOut;
+        TSharedRef<TJsonWriter<>> W3 = TJsonWriterFactory<>::Create(&SuccessOut);
+        FJsonSerializer::Serialize(Resp.ToSharedRef(), W3);
+
+        AsyncTask(ENamedThreads::GameThread, [this, SuccessOut]()
+        {
+            PendingVectorRoadsResult = SuccessOut;
+            LastRoadGeoCount         = -1;
+            RoadGeoStableFrames      = 0;
+            if (RoadRebuildTickerHandle.IsValid())
+                FTSTicker::GetCoreTicker().RemoveTicker(RoadRebuildTickerHandle);
+            RoadRebuildTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+                FTickerDelegate::CreateUObject(this, &UUnrealMCPBridge::PollRoadRebuildComplete), 1.0f);
+        });
+
+        constexpr float PollSec  = 0.1f;
+        constexpr float LimitSec = 300.f;
+        for (float Elapsed = 0.f; Elapsed < LimitSec; Elapsed += PollSec)
+        {
+            if (RebuildFuture.IsReady()) return RebuildFuture.Get();
+            FPlatformProcess::Sleep(PollSec);
+        }
+
+        TSharedPtr<FJsonObject> T = MakeShared<FJsonObject>();
+        T->SetStringField(TEXT("status"), TEXT("error"));
+        T->SetStringField(TEXT("error"), TEXT("gis_rebuild_road_networks timed out after 300 s"));
+        FString Tout;
+        TSharedRef<TJsonWriter<>> Wt = TJsonWriterFactory<>::Create(&Tout);
+        FJsonSerializer::Serialize(T.ToSharedRef(), Wt);
+        if (PendingVectorRoadsPromise.IsValid())
+        {
+            PendingVectorRoadsPromise->SetValue(Tout);
+            PendingVectorRoadsPromise.Reset();
+        }
+        return Tout;
     }
 
     // take_screenshot: fire HighResShot on game thread, poll for the file here so
@@ -1281,7 +1382,11 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_summarize_lane_graph") ||
                      CommandType == TEXT("gis_validate_road_network") ||
                      CommandType == TEXT("gis_reconcile_road_network") ||
-                     CommandType == TEXT("gis_list_report_markers"))
+                     CommandType == TEXT("gis_list_report_markers") ||
+                     CommandType == TEXT("gis_list_districts") ||
+                     CommandType == TEXT("gis_generate_block_shapes") ||
+                     CommandType == TEXT("gis_assign_district") ||
+                     CommandType == TEXT("gis_generate_buildings"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);
             }
