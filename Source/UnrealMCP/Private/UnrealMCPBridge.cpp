@@ -133,6 +133,14 @@ void UUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
         CLIBridge = MakeUnique<FUnrealMCPCLIBridge>(this);
         CLIBridge->Start();
     }
+
+    // Start the permanent autosave watchdog. Fires every 2 s; disables autosave any time
+    // RoadGeo actor count is changing (rebuild in flight from any source), re-enables after
+    // 60 s of stability. This guards against all rebuild triggers, not just our own commands.
+    WatchdogTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateUObject(this, &UUnrealMCPBridge::WatchdogTickRoadRebuild),
+        2.0f);
+    UE_LOG(LogUnrealMCP, Display, TEXT("UnrealMCPBridge: autosave watchdog started"));
 }
 
 // Clean up resources when subsystem is destroyed
@@ -143,6 +151,11 @@ void UUnrealMCPBridge::Deinitialize()
     {
         CLIBridge->Stop();
         CLIBridge.Reset();
+    }
+    if (WatchdogTickerHandle.IsValid())
+    {
+        FTSTicker::GetCoreTicker().RemoveTicker(WatchdogTickerHandle);
+        WatchdogTickerHandle.Reset();
     }
     StopServer();
 }
@@ -822,6 +835,48 @@ bool UUnrealMCPBridge::PollRoadRebuildComplete(float /*DeltaTime*/)
     }
     LastRoadGeoCount = CurrentCount;
     return true; // keep ticking
+}
+
+bool UUnrealMCPBridge::WatchdogTickRoadRebuild(float /*DeltaTime*/)
+{
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World) return true;
+
+    TArray<AActor*> GeoActors;
+    UGameplayStatics::GetAllActorsOfClass(World, ARoadGeo::StaticClass(), GeoActors);
+    const int32 CurrentCount = GeoActors.Num();
+
+    if (WatchdogLastRoadGeoCount < 0)
+    {
+        // First tick — initialise without acting.
+        WatchdogLastRoadGeoCount = CurrentCount;
+        return true;
+    }
+
+    UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>();
+
+    if (CurrentCount != WatchdogLastRoadGeoCount)
+    {
+        WatchdogLastRoadGeoCount = CurrentCount;
+        WatchdogStableChecks = 0;
+        if (Cfg && Cfg->bAutoSaveEnable)
+        {
+            Cfg->bAutoSaveEnable = false;
+            UE_LOG(LogUnrealMCP, Log, TEXT("Watchdog: RoadGeo count changed to %d — autosave disabled"), CurrentCount);
+        }
+    }
+    else
+    {
+        WatchdogStableChecks++;
+        // 30 ticks × 2 s = 60 s stable
+        if (WatchdogStableChecks == 30 && Cfg && !Cfg->bAutoSaveEnable)
+        {
+            Cfg->bAutoSaveEnable = true;
+            UE_LOG(LogUnrealMCP, Log, TEXT("Watchdog: RoadGeo stable at %d for 60 s — autosave re-enabled"), CurrentCount);
+        }
+    }
+
+    return true; // always keep ticking
 }
 
 void UUnrealMCPBridge::StartVectorRoadsImport(const TSharedPtr<FJsonObject>& Params)
