@@ -32,6 +32,7 @@
 #include "DynamicRoad/DynamicRoadIntersection.h"
 
 #include "Engine/Blueprint.h"
+#include "Settings/EditorLoadingSavingSettings.h"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -112,12 +113,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             FString::Printf(TEXT("gis_create_level: failed to create '%s'"), *LevelPath));
 
-    // Disable One-File-Per-Actor (OFPA) for this level.  With OFPA on, every actor
-    // gets its own package; saving the level runs FArchiveGatherExternalActorRefs on
-    // each actor's package, which traverses ULandscapeSplineSegment objects that
-    // RebuildRoadNetworkIncremental workers may still be modifying → SIGSEGV.
-    // With OFPA off, all actors live in the main level package and that traversal is
-    // skipped, making saves safe regardless of road rebuild timing.
+    // Disable One-File-Per-Actor (OFPA) for this level: all actors live in the main
+    // level package, avoiding the proliferation of per-actor .uasset files.
+    // Note: this does NOT prevent FArchiveGatherExternalActorRefs from running during
+    // save (it runs on the main package regardless); the autosave race is addressed by
+    // disabling autosave in gis_generate_procedural_roads / gis_build_zone_graph.
     if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
         if (ULevel* Level = World->GetCurrentLevel())
             Level->bUseExternalActors = false;
@@ -933,6 +933,17 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleBuildZoneGraph(const TShare
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             TEXT("gis_build_zone_graph: UTempoRoadLaneGraphSubsystem unavailable — is TempoAgents enabled?"));
 
+    // Disable autosave while ZoneGraph runs.  DetectAndStoreEdgeIntersections /
+    // CreatePerimeterCuts read road spline geometry, which can trigger mirror-spline
+    // refreshes that re-fire RebuildRoadNetworkIncremental in the background.
+    // A concurrent autosave would race with those workers on the spline objects.
+    // gis_rebuild_road_networks (step 7.5) re-enables autosave after the rebuild drains.
+    if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+    {
+        Cfg->bAutoSaveEnable = false;
+        UE_LOG(LogUnrealMCP, Log, TEXT("gis_build_zone_graph: autosave disabled until post-ZoneGraph rebuild drains"));
+    }
+
     // Step 1: ensure perimeter cuts are up-to-date on all road networks.
     // The modern async rebuild (RebuildRoadNetworkIncremental) stores its intersection data
     // in a temporary FRebuildContext and never writes to the legacy RoadNetworkCorners /
@@ -1595,6 +1606,18 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(con
         double SeedD = 42.0;
         if (Params->TryGetNumberField(TEXT("seed"), SeedD))
             Seed = static_cast<int32>(SeedD);
+    }
+
+    // Disable autosave for the duration of the road rebuild.  RebuildRoadNetworkIncremental
+    // runs worker threads that write ULandscapeSplineControlPoint / ULandscapeSplineSegment;
+    // FArchiveGatherExternalActorRefs (invoked by any save, including autosave) serializes
+    // those same objects on the game thread → data race → SIGSEGV.
+    // Callers MUST follow with gis_rebuild_road_networks; that command re-enables autosave
+    // only after the OnComplete callback confirms all workers have finished.
+    if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+    {
+        Cfg->bAutoSaveEnable = false;
+        UE_LOG(LogUnrealMCP, Log, TEXT("gis_generate_procedural_roads: autosave disabled until rebuild completes"));
     }
 
     FString Message;

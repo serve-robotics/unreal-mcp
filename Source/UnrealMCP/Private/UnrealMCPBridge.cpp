@@ -81,6 +81,7 @@
 #include "Roads/ServeGISRoadStyleTable.h"
 #include "GISViewer/ServeGISRoadImportUtils.h"
 #include "Containers/Ticker.h"
+#include "Settings/EditorLoadingSavingSettings.h"
 
 DEFINE_LOG_CATEGORY(LogUnrealMCP);
 
@@ -746,12 +747,10 @@ void UUnrealMCPBridge::OnGISVectorRoadsSucceeded()
     TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
     FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
 
-    // Kick off the road mesh rebuild and return immediately. Callers that need road
-    // meshes and collision before proceeding (e.g. gis_generate_block_shapes) should
-    // first call gis_rebuild_road_networks, which polls via PollRoadRebuildComplete
-    // until RoadGeo actor count has stabilised (rebuild commit finished).
-    Network->RebuildRoadNetworkIncremental({}, {}, false);
-
+    // Rebuild is intentionally NOT triggered here.
+    // gis_rebuild_road_networks uses RebuildRoadNetworkIncremental's OnComplete
+    // callback to block until workers are truly done, preventing the
+    // FArchiveGatherExternalActorRefs data race that caused save-time SIGSEGVs.
     if (PendingVectorRoadsPromise.IsValid())
     {
         PendingVectorRoadsPromise->SetValue(Out);
@@ -996,28 +995,88 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         TSharedRef<TJsonWriter<>> W3 = TJsonWriterFactory<>::Create(&SuccessOut);
         FJsonSerializer::Serialize(Resp.ToSharedRef(), W3);
 
+        // Find the road network and trigger rebuild with the OnComplete callback.
+        // OnComplete fires when ALL worker threads have truly finished modifying
+        // ULandscapeSplineControlPoint / ULandscapeSplineSegment objects.
+        // Only after OnComplete is it safe to re-enable autosave.
         AsyncTask(ENamedThreads::GameThread, [this, SuccessOut]()
         {
-            PendingVectorRoadsResult = SuccessOut;
-            LastRoadGeoCount         = -1;
-            RoadGeoStableFrames      = 0;
-            if (RoadRebuildTickerHandle.IsValid())
-                FTSTicker::GetCoreTicker().RemoveTicker(RoadRebuildTickerHandle);
-            RoadRebuildTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
-                FTickerDelegate::CreateUObject(this, &UUnrealMCPBridge::PollRoadRebuildComplete), 1.0f);
+            // Ensure autosave is off for the rebuild duration (may already be off from
+            // gis_generate_procedural_roads or gis_build_zone_graph; belt-and-suspenders).
+            if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+                Cfg->bAutoSaveEnable = false;
+
+            UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+
+            ADynamicRoadNetwork* Network = nullptr;
+            if (World)
+            {
+                for (TActorIterator<ADynamicRoadNetwork> It(World); It; ++It)
+                {
+                    if (IsValid(*It)) { Network = *It; break; }
+                }
+            }
+
+            if (!Network)
+            {
+                // No road network in scene — nothing to rebuild; resolve immediately.
+                // Re-enable autosave now since there are no workers to wait for.
+                if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+                {
+                    Cfg->bAutoSaveEnable = true;
+                    UE_LOG(LogUnrealMCP, Log, TEXT("gis_rebuild_road_networks: no network, autosave re-enabled"));
+                }
+                if (PendingVectorRoadsPromise.IsValid())
+                {
+                    PendingVectorRoadsPromise->SetValue(SuccessOut);
+                    PendingVectorRoadsPromise.Reset();
+                }
+                return;
+            }
+
+            // The 5-arg overload fires OnComplete when workers are truly done.
+            // Re-enable autosave inside OnComplete — it is safe to save only after this.
+            Network->RebuildRoadNetworkIncremental({}, {}, false, false,
+                [this, SuccessOut]()
+                {
+                    if (PendingVectorRoadsPromise.IsValid())
+                    {
+                        PendingVectorRoadsPromise->SetValue(SuccessOut);
+                        PendingVectorRoadsPromise.Reset();
+                    }
+                    // OnComplete may fire on a background thread; dispatch to game thread.
+                    AsyncTask(ENamedThreads::GameThread, []()
+                    {
+                        if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+                        {
+                            Cfg->bAutoSaveEnable = true;
+                            UE_LOG(LogUnrealMCP, Log, TEXT("gis_rebuild_road_networks: workers done, autosave re-enabled"));
+                        }
+                    });
+                });
         });
 
         constexpr float PollSec  = 0.1f;
-        constexpr float LimitSec = 300.f;
+        constexpr float LimitSec = 900.f; // 15 min — generous for large networks
         for (float Elapsed = 0.f; Elapsed < LimitSec; Elapsed += PollSec)
         {
             if (RebuildFuture.IsReady()) return RebuildFuture.Get();
             FPlatformProcess::Sleep(PollSec);
         }
 
+        // Timeout — re-enable autosave so the editor isn't left with it permanently off.
+        AsyncTask(ENamedThreads::GameThread, []()
+        {
+            if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+            {
+                Cfg->bAutoSaveEnable = true;
+                UE_LOG(LogUnrealMCP, Log, TEXT("gis_rebuild_road_networks: timeout, autosave re-enabled"));
+            }
+        });
+
         TSharedPtr<FJsonObject> T = MakeShared<FJsonObject>();
         T->SetStringField(TEXT("status"), TEXT("error"));
-        T->SetStringField(TEXT("error"), TEXT("gis_rebuild_road_networks timed out after 300 s"));
+        T->SetStringField(TEXT("error"), TEXT("gis_rebuild_road_networks timed out after 900 s"));
         FString Tout;
         TSharedRef<TJsonWriter<>> Wt = TJsonWriterFactory<>::Create(&Tout);
         FJsonSerializer::Serialize(T.ToSharedRef(), Wt);
