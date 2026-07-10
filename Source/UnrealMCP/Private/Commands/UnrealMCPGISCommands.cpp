@@ -1675,6 +1675,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListSidewalkPresets(
 
     FARFilter Filter;
     Filter.PackagePaths.Add(FName("/Game/RoadModules/Sidewalks"));
+    Filter.PackagePaths.Add(FName("/RoadBLD"));
     Filter.bRecursivePaths = true;
     Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
 
@@ -1684,19 +1685,17 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListSidewalkPresets(
     TArray<TSharedPtr<FJsonValue>> Presets;
     for (const FAssetData& AD : Assets)
     {
-        UObject* Loaded = UEditorAssetLibrary::LoadAsset(AD.GetObjectPathString());
-        UBlueprint* BP  = Cast<UBlueprint>(Loaded);
-        if (!BP || !BP->GeneratedClass) continue;
-        if (!BP->GeneratedClass->IsChildOf(URoadBLDSidewalkPreset::StaticClass())) continue;
+        // Build the _C class path (<PackageName>.<AssetName>_C) and load.
+        // Using PackageName (not GetObjectPathString which is already PackageName.AssetName).
+        const FString ClassPath = FString::Printf(TEXT("%s.%s_C"),
+            *AD.PackageName.ToString(), *AD.AssetName.ToString());
+        UClass* PresetClass = LoadClass<URoadBLDSidewalkPreset>(nullptr, *ClassPath);
+        if (!PresetClass) continue; // not a URoadBLDSidewalkPreset subclass
 
         const FString Pkg  = AD.PackageName.ToString();
         FString Theme      = TEXT("other");
         if (Pkg.Contains(TEXT("ModernCityDark"))) Theme = TEXT("dark");
         else if (Pkg.Contains(TEXT("ModernCity"))) Theme = TEXT("modern");
-
-        // Blueprint-generated class path requires _C suffix
-        const FString ClassPath = FString::Printf(TEXT("%s.%s_C"),
-            *AD.GetObjectPathString(), *AD.AssetName.ToString());
 
         auto P = MakeShared<FJsonObject>();
         P->SetStringField(TEXT("name"),       AD.AssetName.ToString());
@@ -1769,6 +1768,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetRoadSidewalk(
 
         FARFilter Filter;
         Filter.PackagePaths.Add(FName("/Game/RoadModules/Sidewalks"));
+        Filter.PackagePaths.Add(FName("/RoadBLD"));
         Filter.bRecursivePaths  = true;
         Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
 
@@ -1778,23 +1778,21 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetRoadSidewalk(
         TArray<FString> Pool;
         for (const FAssetData& AD : Assets)
         {
-            UObject* Loaded = UEditorAssetLibrary::LoadAsset(AD.GetObjectPathString());
-            UBlueprint* BP  = Cast<UBlueprint>(Loaded);
-            if (!BP || !BP->GeneratedClass) continue;
-            if (!BP->GeneratedClass->IsChildOf(URoadBLDSidewalkPreset::StaticClass())) continue;
+            // LoadClass forces blueprint compilation; skip if not a URoadBLDSidewalkPreset subclass
+            const FString CPath = FString::Printf(TEXT("%s.%s_C"),
+                *AD.PackageName.ToString(), *AD.AssetName.ToString());
+            UClass* PC = LoadClass<URoadBLDSidewalkPreset>(nullptr, *CPath);
+            if (!PC) continue;
 
             const FString Pkg = AD.PackageName.ToString();
             bool bMatch = (PresetParam == TEXT("random"));
             if (!bMatch && PresetParam == TEXT("modern"))
                 bMatch = Pkg.Contains(TEXT("ModernCity")) && !Pkg.Contains(TEXT("Dark"));
             if (!bMatch && PresetParam == TEXT("dark"))
-                bMatch = Pkg.Contains(TEXT("ModernCityDark"));
+                bMatch = Pkg.Contains(TEXT("ModernCityDark")) || Pkg.Contains(TEXT("Dark"));
 
             if (bMatch)
-            {
-                Pool.Add(FString::Printf(TEXT("%s.%s_C"),
-                    *AD.GetObjectPathString(), *AD.AssetName.ToString()));
-            }
+                Pool.Add(CPath);
         }
 
         if (Pool.IsEmpty())
