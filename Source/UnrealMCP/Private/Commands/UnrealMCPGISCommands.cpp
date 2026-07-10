@@ -112,6 +112,16 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             FString::Printf(TEXT("gis_create_level: failed to create '%s'"), *LevelPath));
 
+    // Disable One-File-Per-Actor (OFPA) for this level.  With OFPA on, every actor
+    // gets its own package; saving the level runs FArchiveGatherExternalActorRefs on
+    // each actor's package, which traverses ULandscapeSplineSegment objects that
+    // RebuildRoadNetworkIncremental workers may still be modifying → SIGSEGV.
+    // With OFPA off, all actors live in the main level package and that traversal is
+    // skipped, making saves safe regardless of road rebuild timing.
+    if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+        if (ULevel* Level = World->GetCurrentLevel())
+            Level->bUseExternalActors = false;
+
     auto R = MakeShared<FJsonObject>();
     R->SetBoolField(TEXT("success"), true);
     R->SetStringField(TEXT("level_path"), LevelPath);
