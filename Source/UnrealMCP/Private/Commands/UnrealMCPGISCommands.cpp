@@ -109,22 +109,38 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
     if (!LES)
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_create_level: LevelEditorSubsystem unavailable"));
 
-    if (!LES->NewLevel(LevelPath))
-        return FUnrealMCPCommonUtils::CreateErrorResponse(
-            FString::Printf(TEXT("gis_create_level: failed to create '%s'"), *LevelPath));
+    // Optional template_path: "open_world" expands to the engine Open World template;
+    // any other value is used as-is (full content path, e.g. /Engine/Maps/Templates/OpenWorld).
+    FString TemplatePath;
+    bool bUseTemplate = Params->TryGetStringField(TEXT("template_path"), TemplatePath) && !TemplatePath.IsEmpty();
+    if (bUseTemplate && TemplatePath.Equals(TEXT("open_world"), ESearchCase::IgnoreCase))
+        TemplatePath = TEXT("/Engine/Maps/Templates/OpenWorld");
 
-    // Disable One-File-Per-Actor (OFPA) for this level: all actors live in the main
-    // level package, avoiding the proliferation of per-actor .uasset files.
-    // Note: this does NOT prevent FArchiveGatherExternalActorRefs from running during
-    // save (it runs on the main package regardless); the autosave race is addressed by
-    // disabling autosave in gis_generate_procedural_roads / gis_build_zone_graph.
-    if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
-        if (ULevel* Level = World->GetCurrentLevel())
-            Level->bUseExternalActors = false;
+    bool bOk = bUseTemplate
+        ? LES->NewLevelFromTemplate(LevelPath, TemplatePath)
+        : LES->NewLevel(LevelPath);
+
+    if (!bOk)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_create_level: failed to create '%s'%s"),
+                *LevelPath,
+                bUseTemplate ? *FString::Printf(TEXT(" from template '%s'"), *TemplatePath) : TEXT("")));
+
+    // For blank levels, disable OFPA so all actors live in the main package (simpler
+    // level structure). Skip this for template levels — Open World enables OFPA for
+    // World Partition; overriding it would break external actor streaming.
+    if (!bUseTemplate)
+    {
+        if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+            if (ULevel* Level = World->GetCurrentLevel())
+                Level->bUseExternalActors = false;
+    }
 
     auto R = MakeShared<FJsonObject>();
     R->SetBoolField(TEXT("success"), true);
     R->SetStringField(TEXT("level_path"), LevelPath);
+    if (bUseTemplate)
+        R->SetStringField(TEXT("template_path"), TemplatePath);
     return R;
 }
 
