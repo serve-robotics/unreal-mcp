@@ -28,6 +28,7 @@
 
 // RoadBLD
 #include "DynamicRoad/DynamicRoadNetwork.h"
+#include "DynamicRoad/DynamicRoad.h"
 #include "DynamicRoad/DynamicRoadData.h"
 #include "DynamicRoad/DynamicRoadIntersection.h"
 
@@ -90,6 +91,10 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_assign_district"))      return HandleAssignDistrict(Params);
     if (CommandType == TEXT("gis_generate_buildings"))   return HandleGenerateBuildings(Params);
     if (CommandType == TEXT("gis_generate_procedural_roads")) return HandleGenerateProceduralRoads(Params);
+
+    // Sidewalk theming
+    if (CommandType == TEXT("gis_list_sidewalk_presets")) return HandleListSidewalkPresets(Params);
+    if (CommandType == TEXT("gis_set_road_sidewalk"))     return HandleSetRoadSidewalk(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -1653,6 +1658,203 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(con
     R->SetStringField(TEXT("message"),  Message);
     R->SetNumberField(TEXT("seed"),     Seed);
     R->SetStringField(TEXT("topology"), Topology);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_list_sidewalk_presets
+// Lists all URoadBLDSidewalkPreset Blueprint subclasses found under
+// /Game/RoadModules/Sidewalks/ and their theme classification.
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListSidewalkPresets(
+    const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    IAssetRegistry& AR =
+        FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+
+    FARFilter Filter;
+    Filter.PackagePaths.Add(FName("/Game/RoadModules/Sidewalks"));
+    Filter.bRecursivePaths = true;
+    Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+
+    TArray<FAssetData> Assets;
+    AR.GetAssets(Filter, Assets);
+
+    TArray<TSharedPtr<FJsonValue>> Presets;
+    for (const FAssetData& AD : Assets)
+    {
+        UObject* Loaded = UEditorAssetLibrary::LoadAsset(AD.GetObjectPathString());
+        UBlueprint* BP  = Cast<UBlueprint>(Loaded);
+        if (!BP || !BP->GeneratedClass) continue;
+        if (!BP->GeneratedClass->IsChildOf(URoadBLDSidewalkPreset::StaticClass())) continue;
+
+        const FString Pkg  = AD.PackageName.ToString();
+        FString Theme      = TEXT("other");
+        if (Pkg.Contains(TEXT("ModernCityDark"))) Theme = TEXT("dark");
+        else if (Pkg.Contains(TEXT("ModernCity"))) Theme = TEXT("modern");
+
+        // Blueprint-generated class path requires _C suffix
+        const FString ClassPath = FString::Printf(TEXT("%s.%s_C"),
+            *AD.GetObjectPathString(), *AD.AssetName.ToString());
+
+        auto P = MakeShared<FJsonObject>();
+        P->SetStringField(TEXT("name"),       AD.AssetName.ToString());
+        P->SetStringField(TEXT("class_path"), ClassPath);
+        P->SetStringField(TEXT("theme"),      Theme);
+        Presets.Add(MakeShared<FJsonValueObject>(P));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField (TEXT("success"),        true);
+    R->SetArrayField(TEXT("presets"),        Presets);
+    R->SetNumberField(TEXT("preset_count"),  Presets.Num());
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_set_road_sidewalk
+//
+// Applies a sidewalk preset to all (or one named) ADynamicRoad actors.
+//
+// Params:
+//   "sidewalk_preset" (string, required):
+//     "modern"  — random ModernCity variant
+//     "dark"    — random ModernCityDark variant
+//     "random"  — random from all available presets
+//     "/Game/…" — full Blueprint class path (with or without _C suffix)
+//   "road_name" (string, optional, default "all"):
+//     Actor label of a specific road to target, or "all" for all roads.
+//   "seed" (number, optional):
+//     Integer seed for reproducible random theme selection.
+//
+// Returns: success, applied_class, roads_updated count.
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetRoadSidewalk(
+    const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_set_road_sidewalk: no editor world available"));
+
+    // Parse params
+    FString PresetParam;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("sidewalk_preset"), PresetParam)
+        || PresetParam.IsEmpty())
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_set_road_sidewalk: sidewalk_preset required "
+                 "(\"modern\", \"dark\", \"random\", or full /Game/… class path)"));
+
+    FString TargetRoadName = TEXT("all");
+    if (Params.IsValid()) Params->TryGetStringField(TEXT("road_name"), TargetRoadName);
+
+    int32 Seed = FMath::Rand();
+    if (Params.IsValid())
+    {
+        double SeedD = 0.0;
+        if (Params->TryGetNumberField(TEXT("seed"), SeedD))
+            Seed = static_cast<int32>(SeedD);
+    }
+
+    // Theme keyword → resolve class path using the asset registry
+    FString ResolvedClassPath = PresetParam;
+
+    if (PresetParam == TEXT("modern") || PresetParam == TEXT("dark") ||
+        PresetParam == TEXT("random"))
+    {
+        IAssetRegistry& AR =
+            FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+
+        FARFilter Filter;
+        Filter.PackagePaths.Add(FName("/Game/RoadModules/Sidewalks"));
+        Filter.bRecursivePaths  = true;
+        Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+
+        TArray<FAssetData> Assets;
+        AR.GetAssets(Filter, Assets);
+
+        TArray<FString> Pool;
+        for (const FAssetData& AD : Assets)
+        {
+            UObject* Loaded = UEditorAssetLibrary::LoadAsset(AD.GetObjectPathString());
+            UBlueprint* BP  = Cast<UBlueprint>(Loaded);
+            if (!BP || !BP->GeneratedClass) continue;
+            if (!BP->GeneratedClass->IsChildOf(URoadBLDSidewalkPreset::StaticClass())) continue;
+
+            const FString Pkg = AD.PackageName.ToString();
+            bool bMatch = (PresetParam == TEXT("random"));
+            if (!bMatch && PresetParam == TEXT("modern"))
+                bMatch = Pkg.Contains(TEXT("ModernCity")) && !Pkg.Contains(TEXT("Dark"));
+            if (!bMatch && PresetParam == TEXT("dark"))
+                bMatch = Pkg.Contains(TEXT("ModernCityDark"));
+
+            if (bMatch)
+            {
+                Pool.Add(FString::Printf(TEXT("%s.%s_C"),
+                    *AD.GetObjectPathString(), *AD.AssetName.ToString()));
+            }
+        }
+
+        if (Pool.IsEmpty())
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("gis_set_road_sidewalk: no presets found for theme \"%s\""),
+                    *PresetParam));
+
+        FRandomStream Rand(Seed);
+        ResolvedClassPath = Pool[Rand.RandRange(0, Pool.Num() - 1)];
+    }
+
+    // Ensure the class path has the _C suffix required for Blueprint generated classes
+    if (!ResolvedClassPath.EndsWith(TEXT("_C")))
+        ResolvedClassPath += TEXT("_C");
+
+    // Load the sidewalk preset class
+    UClass* PresetClass = LoadClass<URoadBLDSidewalkPreset>(nullptr, *ResolvedClassPath);
+    if (!PresetClass)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_set_road_sidewalk: could not load class \"%s\""),
+                *ResolvedClassPath));
+
+    // Apply to matching road actors
+    int32 Updated = 0;
+    for (TActorIterator<ADynamicRoad> It(World); It; ++It)
+    {
+        ADynamicRoad* Road = *It;
+        if (!IsValid(Road)) continue;
+
+        const bool bTargetAll  = TargetRoadName.IsEmpty() || TargetRoadName == TEXT("all");
+        const bool bNameMatch  = Road->GetActorLabel() == TargetRoadName;
+        if (!bTargetAll && !bNameMatch) continue;
+
+        Road->LeftSidewalkPreset  = PresetClass;
+        Road->RightSidewalkPreset = PresetClass;
+
+        // InitializeRoad regenerates the road's mesh/module geometry using the updated presets.
+        // Uses Road->SourceDrawPreset (the preset assigned at spawning time).
+        if (Road->SourceDrawPreset)
+        {
+            Road->InitializeRoad(Road->SourceDrawPreset, 0.0);
+        }
+        Road->MarkPackageDirty();
+        Updated++;
+    }
+
+    if (Updated == 0)
+    {
+        const bool bIsAll = TargetRoadName.IsEmpty() || TargetRoadName == TEXT("all");
+        const FString Err = bIsAll
+            ? TEXT("gis_set_road_sidewalk: no ADynamicRoad actors found in level")
+            : FString::Printf(TEXT("gis_set_road_sidewalk: no road named \"%s\" found"),
+                *TargetRoadName);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(Err);
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),       true);
+    R->SetStringField(TEXT("applied_class"), ResolvedClassPath);
+    R->SetNumberField(TEXT("roads_updated"), Updated);
     return R;
 }
 

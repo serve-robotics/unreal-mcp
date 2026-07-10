@@ -55,4 +55,8 @@ private:
 
     // Procedural road network generation (FProceduralRoadGen)
     TSharedPtr<FJsonObject> HandleGenerateProceduralRoads(const TSharedPtr<FJsonObject>& Params);
+
+    // Sidewalk theming
+    TSharedPtr<FJsonObject> HandleListSidewalkPresets(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetRoadSidewalk(const TSharedPtr<FJsonObject>& Params);
 };
