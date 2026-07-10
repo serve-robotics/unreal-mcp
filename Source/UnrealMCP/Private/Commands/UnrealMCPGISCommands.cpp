@@ -1616,12 +1616,16 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(con
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             TEXT("gis_generate_procedural_roads: no editor world available"));
 
-    int32 Seed = 42;
+    int32   Seed     = 42;
+    FString Topology = TEXT("ring_branch");
     if (Params.IsValid())
     {
         double SeedD = 42.0;
         if (Params->TryGetNumberField(TEXT("seed"), SeedD))
             Seed = static_cast<int32>(SeedD);
+        FString TopologyStr;
+        if (Params->TryGetStringField(TEXT("topology"), TopologyStr) && !TopologyStr.IsEmpty())
+            Topology = TopologyStr;
     }
 
     // Disable autosave for the duration of the road rebuild.  RebuildRoadNetworkIncremental
@@ -1637,7 +1641,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(con
     }
 
     FString Message;
-    FProceduralRoadGen::Generate(World, Seed, Message);
+    FProceduralRoadGen::Generate(World, Seed, Topology, Message);
 
     // Generate sets an error-like message when it aborts early (starts with "No ").
     if (Message.StartsWith(TEXT("No ")) || Message.StartsWith(TEXT("Failed")))
@@ -1645,9 +1649,10 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(con
             FString::Printf(TEXT("gis_generate_procedural_roads: %s"), *Message));
 
     auto R = MakeShared<FJsonObject>();
-    R->SetBoolField  (TEXT("success"), true);
-    R->SetStringField(TEXT("message"), Message);
-    R->SetNumberField(TEXT("seed"),    Seed);
+    R->SetBoolField  (TEXT("success"),  true);
+    R->SetStringField(TEXT("message"),  Message);
+    R->SetNumberField(TEXT("seed"),     Seed);
+    R->SetStringField(TEXT("topology"), Topology);
     return R;
 }
 
