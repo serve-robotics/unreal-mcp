@@ -511,10 +511,15 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFocusViewport(const TSha
     }
 
     // Get the active viewport
-    FLevelEditorViewportClient* ViewportClient = (FLevelEditorViewportClient*)GEditor->GetActiveViewport()->GetClient();
+    FViewport* ActiveViewport = GEditor ? GEditor->GetActiveViewport() : nullptr;
+    if (!ActiveViewport)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("focus_viewport: no active viewport (editor may still be initializing)"));
+    }
+    FLevelEditorViewportClient* ViewportClient = (FLevelEditorViewportClient*)ActiveViewport->GetClient();
     if (!ViewportClient)
     {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get active viewport"));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get active viewport client"));
     }
 
     // If we have a target actor, focus on it
