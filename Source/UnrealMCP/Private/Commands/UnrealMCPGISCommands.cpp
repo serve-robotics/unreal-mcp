@@ -131,15 +131,14 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
                 *LevelPath,
                 bUseTemplate ? *FString::Printf(TEXT(" from template '%s'"), *TemplatePath) : TEXT("")));
 
-    // For blank levels, disable OFPA so all actors live in the main package (simpler
-    // level structure). Skip this for template levels — Open World enables OFPA for
-    // World Partition; overriding it would break external actor streaming.
-    if (!bUseTemplate)
-    {
-        if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
-            if (ULevel* Level = World->GetCurrentLevel())
-                Level->bUseExternalActors = false;
-    }
+    // Always disable OFPA (One File Per Actor) so all actors live in the main package.
+    // With OFPA on, saving triggers FArchiveGatherExternalActorRefs which recursively
+    // serializes ULandscapeSplineSegment/ULandscapeSplineControlPoint cycles (ring graph
+    // from the road rebuild) and stack-overflows. Actors are still WP-streamable without
+    // OFPA; streaming is cell-based, not file-based.
+    if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+        if (ULevel* Level = World->GetCurrentLevel())
+            Level->bUseExternalActors = false;
 
     auto R = MakeShared<FJsonObject>();
     R->SetBoolField(TEXT("success"), true);
@@ -1621,8 +1620,9 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(con
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             TEXT("gis_generate_procedural_roads: no editor world available"));
 
-    int32   Seed     = 42;
-    FString Topology = TEXT("ring_branch");
+    int32   Seed        = 42;
+    FString Topology    = TEXT("ring_branch");
+    float   RingCluster = 3.0f;
     if (Params.IsValid())
     {
         double SeedD = 42.0;
@@ -1631,6 +1631,9 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(con
         FString TopologyStr;
         if (Params->TryGetStringField(TEXT("topology"), TopologyStr) && !TopologyStr.IsEmpty())
             Topology = TopologyStr;
+        double ClusterD = 3.0;
+        if (Params->TryGetNumberField(TEXT("ring_cluster"), ClusterD))
+            RingCluster = FMath::Max(1.0f, static_cast<float>(ClusterD));
     }
 
     // Disable autosave for the duration of the road rebuild.  RebuildRoadNetworkIncremental
@@ -1646,7 +1649,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(con
     }
 
     FString Message;
-    FProceduralRoadGen::Generate(World, Seed, Topology, Message);
+    FProceduralRoadGen::Generate(World, Seed, Topology, RingCluster, Message);
 
     // Generate sets an error-like message when it aborts early (starts with "No ").
     if (Message.StartsWith(TEXT("No ")) || Message.StartsWith(TEXT("Failed")))
@@ -1654,10 +1657,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(con
             FString::Printf(TEXT("gis_generate_procedural_roads: %s"), *Message));
 
     auto R = MakeShared<FJsonObject>();
-    R->SetBoolField  (TEXT("success"),  true);
-    R->SetStringField(TEXT("message"),  Message);
-    R->SetNumberField(TEXT("seed"),     Seed);
-    R->SetStringField(TEXT("topology"), Topology);
+    R->SetBoolField  (TEXT("success"),      true);
+    R->SetStringField(TEXT("message"),      Message);
+    R->SetNumberField(TEXT("seed"),         Seed);
+    R->SetStringField(TEXT("topology"),     Topology);
+    R->SetNumberField(TEXT("ring_cluster"), RingCluster);
     return R;
 }
 

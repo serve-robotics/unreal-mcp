@@ -73,6 +73,8 @@
 #include "Anchor/ServeGeoAnchor.h"
 #include "Types/ServeGISTypes.h"
 #include "Landscape.h" // full ALandscape definition (needed for CreatedLandscapes access)
+#include "LandscapeProxy.h"
+#include "LandscapeSplinesComponent.h"
 
 // RoadBLD — for road creation from vector shapes
 #include "DynamicRoad/DynamicRoad.h"
@@ -1090,22 +1092,47 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
             }
 
             // The 5-arg overload fires OnComplete when workers are truly done.
-            // Re-enable autosave inside OnComplete — it is safe to save only after this.
+            // Clear landscape splines and re-enable autosave on game thread, then
+            // fulfill the promise — ensures saves are safe before callers proceed.
             Network->RebuildRoadNetworkIncremental({}, {}, false, false,
                 [this, SuccessOut]()
                 {
-                    if (PendingVectorRoadsPromise.IsValid())
+                    // OnComplete may fire on a background thread; dispatch to game thread
+                    // for UObject modifications and promise fulfillment.
+                    AsyncTask(ENamedThreads::GameThread, [this, SuccessOut]()
                     {
-                        PendingVectorRoadsPromise->SetValue(SuccessOut);
-                        PendingVectorRoadsPromise.Reset();
-                    }
-                    // OnComplete may fire on a background thread; dispatch to game thread.
-                    AsyncTask(ENamedThreads::GameThread, []()
-                    {
+                        // Clear landscape splines to prevent FArchiveGatherExternalActorRefs
+                        // from recursively traversing the spline ring graph and stack-overflowing
+                        // during World Partition saves. The road geometry lives in ARoadGeo static
+                        // meshes; landscape splines are only used for terrain deformation and are
+                        // safe to discard after the rebuild is complete.
+                        if (UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+                        {
+                            for (TActorIterator<ALandscapeProxy> It(W); It; ++It)
+                            {
+                                if (!IsValid(*It)) continue;
+                                if (ULandscapeSplinesComponent* SC = It->GetSplinesComponent())
+                                {
+                                    SC->Modify();
+                                    SC->GetControlPoints().Empty();
+                                    SC->GetSegments().Empty();
+                                    UE_LOG(LogUnrealMCP, Log,
+                                        TEXT("gis_rebuild_road_networks: cleared landscape splines on %s"),
+                                        *It->GetName());
+                                }
+                            }
+                        }
+
                         if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
                         {
                             Cfg->bAutoSaveEnable = true;
                             UE_LOG(LogUnrealMCP, Log, TEXT("gis_rebuild_road_networks: workers done, autosave re-enabled"));
+                        }
+
+                        if (PendingVectorRoadsPromise.IsValid())
+                        {
+                            PendingVectorRoadsPromise->SetValue(SuccessOut);
+                            PendingVectorRoadsPromise.Reset();
                         }
                     });
                 });
@@ -1425,18 +1452,44 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         try
         {
             TSharedPtr<FJsonObject> ResultJson;
-            
+
+            // Block actor-modifying commands while a road rebuild is in flight.
+            // ULandscapeSplineSegment::Serialize crashes when World Partition gathers
+            // external actor refs (triggered by spawning/destroying actors) while
+            // RebuildRoadNetworkIncremental workers are still touching spline data.
+            static const TSet<FString> RebuildSafeCommands = {
+                TEXT("ping"), TEXT("get_actors_in_level"), TEXT("find_actors_by_name"),
+                TEXT("get_actor_properties"), TEXT("focus_viewport"),
+                TEXT("gis_rebuild_road_networks"), TEXT("gis_import_landscape"),
+                TEXT("gis_import_vector_roads"), TEXT("gis_viewer_clear"),
+                TEXT("gis_viewer_load_file"), TEXT("gis_viewer_list_layers"),
+            };
+            if (PendingVectorRoadsPromise.IsValid() && !RebuildSafeCommands.Contains(CommandType))
+            {
+                ResultJson = MakeShareable(new FJsonObject);
+                ResultJson->SetBoolField(TEXT("success"), false);
+                ResultJson->SetStringField(TEXT("error"),
+                    TEXT("road rebuild in progress — retry after gis_rebuild_road_networks succeeds"));
+                ResponseJson->SetStringField(TEXT("status"), TEXT("error"));
+                ResponseJson->SetObjectField(TEXT("result"), ResultJson);
+                FString RebuildBusyOut;
+                TSharedRef<TJsonWriter<>> RBW = TJsonWriterFactory<>::Create(&RebuildBusyOut);
+                FJsonSerializer::Serialize(ResponseJson.ToSharedRef(), RBW);
+                Promise.SetValue(RebuildBusyOut);
+                return;
+            }
+
             if (CommandType == TEXT("ping"))
             {
                 ResultJson = MakeShareable(new FJsonObject);
                 ResultJson->SetStringField(TEXT("message"), TEXT("pong"));
             }
             // Editor Commands (including actor manipulation)
-            else if (CommandType == TEXT("get_actors_in_level") || 
+            else if (CommandType == TEXT("get_actors_in_level") ||
                      CommandType == TEXT("find_actors_by_name") ||
                      CommandType == TEXT("spawn_actor") ||
                      CommandType == TEXT("create_actor") ||
-                     CommandType == TEXT("delete_actor") || 
+                     CommandType == TEXT("delete_actor") ||
                      CommandType == TEXT("set_actor_transform") ||
                      CommandType == TEXT("get_actor_properties") ||
                      CommandType == TEXT("set_actor_property") ||
