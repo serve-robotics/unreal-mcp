@@ -795,7 +795,16 @@ bool UUnrealMCPBridge::PollRoadRebuildComplete(float /*DeltaTime*/)
     if (CurrentCount > 0 && CurrentCount == LastRoadGeoCount)
     {
         RoadGeoStableFrames++;
-        if (RoadGeoStableFrames >= 3) // stable for 3 consecutive 1-second ticks
+        // Require 10 consecutive stable 1-second ticks (not 3) before resolving.
+        //
+        // "Count stable" means no new RoadGeo actors are being spawned, but
+        // RebuildRoadNetworkIncremental worker threads may still be finalizing
+        // ULandscapeSplineControlPoint / ULandscapeSplineSegment data.  If anything
+        // serializes those objects (FArchiveGatherExternalActorRefs triggered by a
+        // level save) before the workers finish, we get a SIGSEGV / stack overflow.
+        // 10 s of stability gives the spline workers time to wind down completely
+        // without blocking the game thread with an explicit sleep.
+        if (RoadGeoStableFrames >= 10)
         {
             if (PendingVectorRoadsPromise.IsValid())
             {
