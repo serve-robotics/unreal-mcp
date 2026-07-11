@@ -75,6 +75,7 @@
 #include "Landscape.h" // full ALandscape definition (needed for CreatedLandscapes access)
 #include "LandscapeProxy.h"
 #include "LandscapeSplinesComponent.h"
+#include "LandscapeSplineActor.h"
 
 // RoadBLD — for road creation from vector shapes
 #include "DynamicRoad/DynamicRoad.h"
@@ -1101,24 +1102,46 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                     // for UObject modifications and promise fulfillment.
                     AsyncTask(ENamedThreads::GameThread, [this, SuccessOut]()
                     {
-                        // Clear landscape splines to prevent FArchiveGatherExternalActorRefs
-                        // from recursively traversing the spline ring graph and stack-overflowing
-                        // during World Partition saves. The road geometry lives in ARoadGeo static
-                        // meshes; landscape splines are only used for terrain deformation and are
-                        // safe to discard after the rebuild is complete.
+                        // Destroy all landscape spline data to prevent FArchiveGatherExternalActorRefs
+                        // from stack-overflowing on the cyclic ControlPoint↔Segment ring graph
+                        // during World Partition saves. Road geometry lives in ARoadGeo static meshes;
+                        // landscape splines are only used for terrain deformation and are safe to
+                        // discard after rebuild. Two spline storage paths must be cleared:
+                        //   1. ALandscapeSplineActor (UE5 WP-style standalone spline actors)
+                        //   2. ULandscapeSplinesComponent on ALandscapeProxy actors (legacy path)
                         if (UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
                         {
+                            // Path 1: destroy ALandscapeSplineActor actors (the primary culprit —
+                            // these are NOT ALandscapeProxy subclasses and were missed by the
+                            // previous ALandscapeProxy iterator, leaving their ring graph intact).
+                            TArray<ALandscapeSplineActor*> SplineActors;
+                            for (TActorIterator<ALandscapeSplineActor> It(W); It; ++It)
+                            {
+                                if (IsValid(*It)) SplineActors.Add(*It);
+                            }
+                            for (ALandscapeSplineActor* SA : SplineActors)
+                            {
+                                UE_LOG(LogUnrealMCP, Log,
+                                    TEXT("gis_rebuild_road_networks: destroying ALandscapeSplineActor %s"),
+                                    *SA->GetName());
+                                SA->Destroy();
+                            }
+
+                            // Path 2: clear ULandscapeSplinesComponent arrays on ALandscapeProxy actors.
                             for (TActorIterator<ALandscapeProxy> It(W); It; ++It)
                             {
                                 if (!IsValid(*It)) continue;
                                 if (ULandscapeSplinesComponent* SC = It->GetSplinesComponent())
                                 {
-                                    SC->Modify();
-                                    SC->GetControlPoints().Empty();
-                                    SC->GetSegments().Empty();
-                                    UE_LOG(LogUnrealMCP, Log,
-                                        TEXT("gis_rebuild_road_networks: cleared landscape splines on %s"),
-                                        *It->GetName());
+                                    if (SC->HasAnyControlPointsOrSegments())
+                                    {
+                                        SC->Modify();
+                                        SC->GetControlPoints().Empty();
+                                        SC->GetSegments().Empty();
+                                        UE_LOG(LogUnrealMCP, Log,
+                                            TEXT("gis_rebuild_road_networks: cleared legacy splines on %s"),
+                                            *It->GetName());
+                                    }
                                 }
                             }
                         }
