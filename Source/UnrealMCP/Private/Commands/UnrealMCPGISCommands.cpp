@@ -31,6 +31,7 @@
 #include "DynamicRoad/DynamicRoad.h"
 #include "DynamicRoad/DynamicRoadData.h"
 #include "DynamicRoad/DynamicRoadIntersection.h"
+#include "DynamicRoad/ClothoidSplineComponent.h"
 
 #include "Engine/Blueprint.h"
 #include "Settings/EditorLoadingSavingSettings.h"
@@ -95,6 +96,9 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     // Sidewalk theming
     if (CommandType == TEXT("gis_list_sidewalk_presets")) return HandleListSidewalkPresets(Params);
     if (CommandType == TEXT("gis_set_road_sidewalk"))     return HandleSetRoadSidewalk(Params);
+
+    // Landscape conformation
+    if (CommandType == TEXT("gis_conform_landscape_to_roads")) return HandleConformLandscapeToRoads(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -1857,6 +1861,54 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetRoadSidewalk(
     R->SetBoolField  (TEXT("success"),       true);
     R->SetStringField(TEXT("applied_class"), ResolvedClassPath);
     R->SetNumberField(TEXT("roads_updated"), Updated);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_conform_landscape_to_roads
+// ---------------------------------------------------------------------------
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
+    const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_conform_landscape_to_roads: no editor world"));
+    }
+
+    int32 Conformed = 0;
+    int32 NoSpline  = 0;
+
+    for (TActorIterator<ADynamicRoad> It(World); It; ++It)
+    {
+        ADynamicRoad* Road = *It;
+        if (!IsValid(Road)) { continue; }
+
+        Road->bEnableLandscapeSplineMirroring = true;
+
+        if (UClothoidSplineComponent* Spline = Road->SplineComponent)
+        {
+            Spline->EnableSplineMirroring(true);
+            Spline->RebuildLandscapeSpline();
+            ++Conformed;
+        }
+        else
+        {
+            ++NoSpline;
+        }
+    }
+
+    if (Conformed == 0 && NoSpline == 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_conform_landscape_to_roads: no ADynamicRoad actors found in level"));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),          true);
+    R->SetNumberField(TEXT("roads_conformed"),  Conformed);
+    R->SetNumberField(TEXT("roads_no_spline"),  NoSpline);
     return R;
 }
 

@@ -59,4 +59,7 @@ private:
     // Sidewalk theming
     TSharedPtr<FJsonObject> HandleListSidewalkPresets(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetRoadSidewalk(const TSharedPtr<FJsonObject>& Params);
+
+    // Landscape conformation
+    TSharedPtr<FJsonObject> HandleConformLandscapeToRoads(const TSharedPtr<FJsonObject>& Params);
 };
