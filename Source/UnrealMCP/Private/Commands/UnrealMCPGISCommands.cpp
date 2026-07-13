@@ -12,6 +12,9 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "LevelEditorSubsystem.h"
 #include "Landscape.h"
+#include "LandscapeProxy.h"
+#include "LandscapeSplineActor.h"
+#include "LandscapeSplinesComponent.h"
 #include "LevelEditor.h"
 #include "ILevelEditor.h"
 #include "SLevelViewport.h"
@@ -108,6 +111,34 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
 // gis_create_level
 // ---------------------------------------------------------------------------
 
+// Destroy all landscape spline actors and clear legacy splines components in the current
+// world. Must be called before loading a new level to avoid FArchiveGatherExternalActorRefs
+// stack-overflowing on the cyclic ControlPoint<->Segment ring graph during world destruction.
+static void DestroyLandscapeSplines(UWorld* World)
+{
+    if (!IsValid(World)) return;
+
+    TArray<ALandscapeSplineActor*> SplineActors;
+    for (TActorIterator<ALandscapeSplineActor> It(World); It; ++It)
+        if (IsValid(*It)) SplineActors.Add(*It);
+    for (ALandscapeSplineActor* SA : SplineActors)
+        SA->Destroy();
+
+    for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+    {
+        if (!IsValid(*It)) continue;
+        if (ULandscapeSplinesComponent* SC = It->GetSplinesComponent())
+        {
+            if (SC->HasAnyControlPointsOrSegments())
+            {
+                SC->Modify();
+                SC->GetControlPoints().Empty();
+                SC->GetSegments().Empty();
+            }
+        }
+    }
+}
+
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPtr<FJsonObject>& Params)
 {
     FString LevelPath;
@@ -124,6 +155,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
     bool bUseTemplate = Params->TryGetStringField(TEXT("template_path"), TemplatePath) && !TemplatePath.IsEmpty();
     if (bUseTemplate && TemplatePath.Equals(TEXT("open_world"), ESearchCase::IgnoreCase))
         TemplatePath = TEXT("/Engine/Maps/Templates/OpenWorld");
+
+    // Purge landscape spline actors from the current world before loading the new level.
+    // Without this, EditorDestroyWorld hits FArchiveGatherExternalActorRefs recursion on
+    // the cyclic ControlPoint<->Segment graph left behind by RebuildRoadNetworkIncremental.
+    DestroyLandscapeSplines(GEditor ? GEditor->GetEditorWorldContext().World() : nullptr);
 
     bool bOk = bUseTemplate
         ? LES->NewLevelFromTemplate(LevelPath, TemplatePath)
