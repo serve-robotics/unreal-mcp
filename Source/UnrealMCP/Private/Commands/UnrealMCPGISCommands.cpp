@@ -1867,14 +1867,27 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetRoadSidewalk(
 // ---------------------------------------------------------------------------
 // gis_conform_landscape_to_roads
 // ---------------------------------------------------------------------------
+// Optional params:
+//   falloff_multiplier  (number, default 2.5)  — LandscapeFalloffMultiplier per road
+//   height_offset       (number, default -25.0) — landscape spline height offset in cm
+//                         applied to every control point; negative pushes terrain below road deck
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
-    const TSharedPtr<FJsonObject>& /*Params*/)
+    const TSharedPtr<FJsonObject>& Params)
 {
     UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
     if (!World)
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             TEXT("gis_conform_landscape_to_roads: no editor world"));
+    }
+
+    double FalloffMultiplier = 2.5;
+    double HeightOffsetCm    = -25.0;
+    if (Params.IsValid())
+    {
+        double V = 0.0;
+        if (Params->TryGetNumberField(TEXT("falloff_multiplier"), V)) FalloffMultiplier = V;
+        if (Params->TryGetNumberField(TEXT("height_offset"),      V)) HeightOffsetCm    = V;
     }
 
     int32 Conformed = 0;
@@ -1886,6 +1899,15 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
         if (!IsValid(Road)) { continue; }
 
         Road->bEnableLandscapeSplineMirroring = true;
+        Road->LandscapeFalloffMultiplier      = static_cast<float>(FalloffMultiplier);
+
+        // Apply per-point height offset so the landscape sits below the road deck
+        // rather than co-planar with it, preventing terrain poke-through on hills.
+        const int32 NumCPs = Road->ControlPoints.Num();
+        for (int32 i = 0; i < NumCPs; ++i)
+        {
+            Road->UpdatePointLandscapeMirrorHeightOffset(i, HeightOffsetCm);
+        }
 
         if (UClothoidSplineComponent* Spline = Road->SplineComponent)
         {
@@ -1906,9 +1928,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
     }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetBoolField  (TEXT("success"),          true);
-    R->SetNumberField(TEXT("roads_conformed"),  Conformed);
-    R->SetNumberField(TEXT("roads_no_spline"),  NoSpline);
+    R->SetBoolField  (TEXT("success"),           true);
+    R->SetNumberField(TEXT("roads_conformed"),   Conformed);
+    R->SetNumberField(TEXT("roads_no_spline"),   NoSpline);
+    R->SetNumberField(TEXT("falloff_multiplier"), FalloffMultiplier);
+    R->SetNumberField(TEXT("height_offset_cm"),  HeightOffsetCm);
     return R;
 }
 
