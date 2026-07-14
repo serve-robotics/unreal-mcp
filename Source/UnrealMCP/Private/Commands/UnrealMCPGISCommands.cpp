@@ -111,19 +111,30 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
 // gis_create_level
 // ---------------------------------------------------------------------------
 
-// Destroy all landscape spline actors and clear legacy splines components in the current
-// world. Must be called before loading a new level to avoid FArchiveGatherExternalActorRefs
-// stack-overflowing on the cyclic ControlPoint<->Segment ring graph during world destruction.
-static void DestroyLandscapeSplines(UWorld* World)
+// Break the cyclic ControlPoint<->Segment ring graph on all landscape spline data in
+// the current world. Must be called before loading a new level to avoid
+// FArchiveGatherExternalActorRefs stack-overflowing during world destruction.
+//
+// We clear the CP/segment arrays rather than calling Destroy() on the actors.
+// Destroy() during an MCP game-thread tick task modifies ALandscapeSplineActor tick
+// registration, which then collides with the TickTaskManager state during the subsequent
+// NewLevelFromTemplate, triggering a !LevelList.Contains(TickTaskLevel) assertion crash.
+static void ClearLandscapeSplineGraph(UWorld* World)
 {
     if (!IsValid(World)) return;
 
-    TArray<ALandscapeSplineActor*> SplineActors;
+    // Path 1: ALandscapeSplineActor (UE5 WP-style standalone spline actors).
     for (TActorIterator<ALandscapeSplineActor> It(World); It; ++It)
-        if (IsValid(*It)) SplineActors.Add(*It);
-    for (ALandscapeSplineActor* SA : SplineActors)
-        SA->Destroy();
+    {
+        if (!IsValid(*It)) continue;
+        if (ULandscapeSplinesComponent* SC = (*It)->GetSplinesComponent())
+        {
+            SC->GetControlPoints().Empty();
+            SC->GetSegments().Empty();
+        }
+    }
 
+    // Path 2: ULandscapeSplinesComponent on ALandscapeProxy actors (legacy path).
     for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
     {
         if (!IsValid(*It)) continue;
@@ -131,7 +142,6 @@ static void DestroyLandscapeSplines(UWorld* World)
         {
             if (SC->HasAnyControlPointsOrSegments())
             {
-                SC->Modify();
                 SC->GetControlPoints().Empty();
                 SC->GetSegments().Empty();
             }
@@ -156,10 +166,10 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
     if (bUseTemplate && TemplatePath.Equals(TEXT("open_world"), ESearchCase::IgnoreCase))
         TemplatePath = TEXT("/Engine/Maps/Templates/OpenWorld");
 
-    // Purge landscape spline actors from the current world before loading the new level.
+    // Break the landscape spline ring graph before loading the new level.
     // Without this, EditorDestroyWorld hits FArchiveGatherExternalActorRefs recursion on
     // the cyclic ControlPoint<->Segment graph left behind by RebuildRoadNetworkIncremental.
-    DestroyLandscapeSplines(GEditor ? GEditor->GetEditorWorldContext().World() : nullptr);
+    ClearLandscapeSplineGraph(GEditor ? GEditor->GetEditorWorldContext().World() : nullptr);
 
     bool bOk = bUseTemplate
         ? LES->NewLevelFromTemplate(LevelPath, TemplatePath)
