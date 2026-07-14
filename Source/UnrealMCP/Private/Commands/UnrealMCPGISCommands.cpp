@@ -61,7 +61,9 @@ FUnrealMCPGISCommands::FUnrealMCPGISCommands()
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     const FString& CommandType, const TSharedPtr<FJsonObject>& Params)
 {
+    // --- Genuinely geospatial (GIS): keep the gis_ prefix ---
     if (CommandType == TEXT("gis_create_level"))       return HandleCreateLevel(Params);
+    // TODO(rename): not geospatial — level lifecycle. Rename to level_open (has existing callers).
     if (CommandType == TEXT("gis_open_level"))         return HandleOpenLevel(Params);
     if (CommandType == TEXT("gis_get_geo_anchor"))     return HandleGetGeoAnchor(Params);
     if (CommandType == TEXT("gis_set_geo_anchor"))     return HandleSetGeoAnchor(Params);
@@ -71,15 +73,23 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_viewer_load_file"))   return HandleViewerLoadFile(Params);
     if (CommandType == TEXT("gis_viewer_list_layers")) return HandleViewerListLayers(Params);
     if (CommandType == TEXT("gis_viewer_clear"))       return HandleViewerClear(Params);
+
+    // TODO(rename): viewport framing, not geospatial. Rename to viewport_focus_landscapes (has existing callers).
     if (CommandType == TEXT("gis_focus_landscapes"))      return HandleFocusLandscapes(Params);
+    // TODO(rename): viewport capture, not geospatial. Rename to viewport_screenshot_markers (has existing callers).
     if (CommandType == TEXT("gis_screenshot_markers"))    return HandleScreenshotMarkers(Params);
-    if (CommandType == TEXT("gis_screenshot_zone_graph")) return HandleScreenshotZoneGraph(Params);
+    // TODO(rename): operates on road-network actors, not GIS. Rename to roadnet_build_zone_graph (has existing callers).
     if (CommandType == TEXT("gis_build_zone_graph"))      return HandleBuildZoneGraph(Params);
-    if (CommandType == TEXT("gis_summarize_road_network_semantic")) return HandleSummarizeRoadNetworkSemantic(Params);
-    if (CommandType == TEXT("gis_summarize_lane_graph"))            return HandleSummarizeLaneGraph(Params);
-    if (CommandType == TEXT("gis_validate_road_network"))           return HandleValidateRoadNetwork(Params);
-    if (CommandType == TEXT("gis_reconcile_road_network"))          return HandleReconcileRoadNetwork(Params);
-    if (CommandType == TEXT("gis_list_report_markers"))             return HandleListReportMarkers(Params);
+
+    // --- Road-network / ZoneGraph diagnostics: no GIS dependency (work on grid-town levels too) ---
+    if (CommandType == TEXT("roadnet_summarize_semantic"))  return HandleSummarizeRoadNetworkSemantic(Params);
+    if (CommandType == TEXT("roadnet_summarize_lane_graph")) return HandleSummarizeLaneGraph(Params);
+    if (CommandType == TEXT("roadnet_validate"))            return HandleValidateRoadNetwork(Params);
+    if (CommandType == TEXT("roadnet_reconcile"))           return HandleReconcileRoadNetwork(Params);
+    if (CommandType == TEXT("roadnet_list_markers"))        return HandleListReportMarkers(Params);
+
+    // --- Editor-viewport visualization: pure UI (show flags + framed capture), no GIS ---
+    if (CommandType == TEXT("viewport_screenshot_zone_graph")) return HandleScreenshotZoneGraph(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -806,7 +816,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotMarkers(
 }
 
 // ---------------------------------------------------------------------------
-// gis_screenshot_zone_graph
+// viewport_screenshot_zone_graph
 // Takes perspective (-45°/45°) and top-down (-89.9°/0°) screenshots of the
 // current level with the Navigation show flag enabled so ZoneGraph lane shapes
 // are visible (Walkable=red, DrivingLane=purple, ClosedLane=blue, etc.).
@@ -818,9 +828,9 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotZoneGraph(
 {
     UWorld* World = GetEditorWorld();
     if (!World)
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: no editor world"));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("viewport_screenshot_zone_graph: no editor world"));
     if (!GEditor)
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: GEditor unavailable"));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("viewport_screenshot_zone_graph: GEditor unavailable"));
 
     // Build landscape bounding box (same logic as gis_focus_landscapes)
     FBox SceneBox(ForceInit);
@@ -833,16 +843,16 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleScreenshotZoneGraph(
         ++LandscapeCount;
     }
     if (LandscapeCount == 0)
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: no Landscape actors in level"));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("viewport_screenshot_zone_graph: no Landscape actors in level"));
 
     FLevelEditorModule& LEM = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
     TSharedPtr<ILevelEditor> LE = LEM.GetFirstLevelEditor();
     if (!LE.IsValid())
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: LevelEditor unavailable"));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("viewport_screenshot_zone_graph: LevelEditor unavailable"));
 
     TSharedPtr<SLevelViewport> VP = LE->GetActiveViewportInterface();
     if (!VP.IsValid())
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_screenshot_zone_graph: no active viewport"));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("viewport_screenshot_zone_graph: no active viewport"));
 
     FLevelEditorViewportClient* VC = &VP->GetLevelViewportClient();
 
@@ -1155,7 +1165,7 @@ namespace DiagJson
 } // namespace DiagJson
 
 // ---------------------------------------------------------------------------
-// gis_summarize_road_network_semantic
+// roadnet_summarize_semantic
 // ---------------------------------------------------------------------------
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSummarizeRoadNetworkSemantic(
@@ -1164,7 +1174,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSummarizeRoadNetworkSemanti
     UWorld* World = GetEditorWorld();
     if (!World)
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            TEXT("gis_summarize_road_network_semantic: no editor world"));
+            TEXT("roadnet_summarize_semantic: no editor world"));
 
     FServeRoadDiagFilter Filter = DiagJson::ParseFilter(Params);
     FServeSemanticSummary Sum   = FServeRoadNetworkDiagnostics::GatherSemanticSummary(World, Filter);
@@ -1247,7 +1257,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSummarizeRoadNetworkSemanti
 }
 
 // ---------------------------------------------------------------------------
-// gis_summarize_lane_graph
+// roadnet_summarize_lane_graph
 // ---------------------------------------------------------------------------
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSummarizeLaneGraph(
@@ -1256,7 +1266,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSummarizeLaneGraph(
     UWorld* World = GetEditorWorld();
     if (!World)
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            TEXT("gis_summarize_lane_graph: no editor world"));
+            TEXT("roadnet_summarize_lane_graph: no editor world"));
 
     FServeRoadDiagFilter Filter = DiagJson::ParseFilter(Params);
     FServeZoneGraphSummary Sum  = FServeRoadNetworkDiagnostics::GatherZoneGraphSummary(World, Filter);
@@ -1361,7 +1371,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSummarizeLaneGraph(
 }
 
 // ---------------------------------------------------------------------------
-// gis_validate_road_network
+// roadnet_validate
 // ---------------------------------------------------------------------------
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleValidateRoadNetwork(
@@ -1370,7 +1380,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleValidateRoadNetwork(
     UWorld* World = GetEditorWorld();
     if (!World)
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            TEXT("gis_validate_road_network: no editor world"));
+            TEXT("roadnet_validate: no editor world"));
 
     FServeRoadDiagFilter Filter = DiagJson::ParseFilter(Params);
 
@@ -1420,7 +1430,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleValidateRoadNetwork(
 }
 
 // ---------------------------------------------------------------------------
-// gis_reconcile_road_network
+// roadnet_reconcile
 // ---------------------------------------------------------------------------
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleReconcileRoadNetwork(
@@ -1429,7 +1439,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleReconcileRoadNetwork(
     UWorld* World = GetEditorWorld();
     if (!World)
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            TEXT("gis_reconcile_road_network: no editor world"));
+            TEXT("roadnet_reconcile: no editor world"));
 
     FServeRoadDiagFilter Filter = DiagJson::ParseFilter(Params);
 
@@ -1472,7 +1482,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleReconcileRoadNetwork(
 }
 
 // ---------------------------------------------------------------------------
-// gis_list_report_markers
+// roadnet_list_markers
 // ---------------------------------------------------------------------------
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListReportMarkers(
@@ -1481,7 +1491,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListReportMarkers(
     UWorld* World = GetEditorWorld();
     if (!World)
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            TEXT("gis_list_report_markers: no editor world"));
+            TEXT("roadnet_list_markers: no editor world"));
 
     FName TagFilter = NAME_None;
     FString TagStr;

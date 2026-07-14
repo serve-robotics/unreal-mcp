@@ -1003,9 +1003,10 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         return MakeJsonStr(Resp);
     }
 
-    // gis_set_zone_graph_overlay: enable or disable the Navigation show flag in the active viewport.
-    // {"type":"gis_set_zone_graph_overlay","params":{"enabled":true}}
-    if (CommandType == TEXT("gis_set_zone_graph_overlay"))
+    // viewport_set_zone_graph_overlay: enable or disable the Navigation show flag in the active viewport.
+    // Pure editor-viewport UI (a show flag), no GIS dependency — hence the viewport_ prefix.
+    // {"type":"viewport_set_zone_graph_overlay","params":{"enabled":true}}
+    if (CommandType == TEXT("viewport_set_zone_graph_overlay"))
     {
         bool bEnable = true;
         Params->TryGetBoolField(TEXT("enabled"), bEnable);
@@ -1035,10 +1036,11 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         return Out;
     }
 
-    // gis_screenshot_zone_graph: enable Navigation show flag (drives ZoneGraph lane rendering),
+    // viewport_screenshot_zone_graph: enable Navigation show flag (drives ZoneGraph lane rendering),
     // take perspective + top-down screenshots, then leave the flag ON so zone graph stays visible.
+    // Editor-viewport capture, no GIS dependency — hence the viewport_ prefix.
     // Handled here (server thread) so the game thread is free to render while we poll for files.
-    if (CommandType == TEXT("gis_screenshot_zone_graph"))
+    if (CommandType == TEXT("viewport_screenshot_zone_graph"))
     {
         auto MakeJsonStrZG = [](TSharedPtr<FJsonObject> Obj) -> FString {
             FString S; TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&S);
@@ -1058,18 +1060,18 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         AsyncTask(ENamedThreads::GameThread, [P = MoveTemp(CtxPromise)]() mutable {
             FZGContext C;
             UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
-            if (!W) { C.Err = TEXT("gis_screenshot_zone_graph: no editor world"); P.SetValue(C); return; }
+            if (!W) { C.Err = TEXT("viewport_screenshot_zone_graph: no editor world"); P.SetValue(C); return; }
             C.Box = FBox(ForceInit);
             for (TActorIterator<ALandscape> It(W); It; ++It) {
                 FVector O, E; It->GetActorBounds(false, O, E);
                 C.Box += FBox(O-E, O+E);
             }
-            if (!C.Box.IsValid) { C.Err = TEXT("gis_screenshot_zone_graph: no Landscape actors"); P.SetValue(C); return; }
+            if (!C.Box.IsValid) { C.Err = TEXT("viewport_screenshot_zone_graph: no Landscape actors"); P.SetValue(C); return; }
             auto& LEM = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
             auto LE = LEM.GetFirstLevelEditor();
-            if (!LE) { C.Err = TEXT("gis_screenshot_zone_graph: LevelEditor unavailable"); P.SetValue(C); return; }
+            if (!LE) { C.Err = TEXT("viewport_screenshot_zone_graph: LevelEditor unavailable"); P.SetValue(C); return; }
             auto VP = LE->GetActiveViewportInterface();
-            if (!VP) { C.Err = TEXT("gis_screenshot_zone_graph: no active viewport"); P.SetValue(C); return; }
+            if (!VP) { C.Err = TEXT("viewport_screenshot_zone_graph: no active viewport"); P.SetValue(C); return; }
             FLevelEditorViewportClient* VC = &VP->GetLevelViewportClient();
             C.bWasNav = VC->EngineShowFlags.Navigation != 0;
             VC->EngineShowFlags.SetNavigation(true);
@@ -1177,7 +1179,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         });
 
         if (!bPerspOk && !bTopOk)
-            return ErrZG(TEXT("gis_screenshot_zone_graph: HighResShot did not produce files within timeout"));
+            return ErrZG(TEXT("viewport_screenshot_zone_graph: HighResShot did not produce files within timeout"));
 
         TSharedPtr<FJsonObject> ZGResult = MakeShared<FJsonObject>();
         ZGResult->SetStringField(TEXT("perspective"), bPerspOk ? PerspPath : TEXT("(failed)"));
@@ -1263,7 +1265,10 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                 ResultJson = UMGCommands->HandleCommand(CommandType, Params);
             }
             // GIS Commands (synchronous; gis_import_landscape and gis_import_vector_roads handled above)
+            // roadnet_* diagnostics and viewport_* visualization route through the same
+            // FUnrealMCPGISCommands handler.
             else if (CommandType == TEXT("gis_create_level") ||
+                     // TODO(rename): gis_open_level -> level_open (not geospatial)
                      CommandType == TEXT("gis_open_level") ||
                      CommandType == TEXT("gis_get_geo_anchor") ||
                      CommandType == TEXT("gis_set_geo_anchor") ||
@@ -1273,15 +1278,18 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_viewer_load_file") ||
                      CommandType == TEXT("gis_viewer_list_layers") ||
                      CommandType == TEXT("gis_viewer_clear") ||
+                     // TODO(rename): gis_focus_landscapes -> viewport_focus_landscapes
                      CommandType == TEXT("gis_focus_landscapes") ||
+                     // TODO(rename): gis_screenshot_markers -> viewport_screenshot_markers
                      CommandType == TEXT("gis_screenshot_markers") ||
-                     CommandType == TEXT("gis_screenshot_zone_graph") ||
+                     // TODO(rename): gis_build_zone_graph -> roadnet_build_zone_graph
                      CommandType == TEXT("gis_build_zone_graph") ||
-                     CommandType == TEXT("gis_summarize_road_network_semantic") ||
-                     CommandType == TEXT("gis_summarize_lane_graph") ||
-                     CommandType == TEXT("gis_validate_road_network") ||
-                     CommandType == TEXT("gis_reconcile_road_network") ||
-                     CommandType == TEXT("gis_list_report_markers"))
+                     // Road-network diagnostics (no GIS dependency)
+                     CommandType == TEXT("roadnet_summarize_semantic") ||
+                     CommandType == TEXT("roadnet_summarize_lane_graph") ||
+                     CommandType == TEXT("roadnet_validate") ||
+                     CommandType == TEXT("roadnet_reconcile") ||
+                     CommandType == TEXT("roadnet_list_markers"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);
             }
