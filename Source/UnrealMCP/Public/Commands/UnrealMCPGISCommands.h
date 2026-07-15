@@ -53,4 +53,20 @@ private:
     TSharedPtr<FJsonObject> HandleReconcileRoadNetwork(const TSharedPtr<FJsonObject>& Params);
     // roadnet_list_markers
     TSharedPtr<FJsonObject> HandleListReportMarkers(const TSharedPtr<FJsonObject>& Params);
+
+    // City block and building generation (FCityGenerationUtils)
+    TSharedPtr<FJsonObject> HandleListDistricts(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleGenerateBlockShapes(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleAssignDistrict(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleGenerateBuildings(const TSharedPtr<FJsonObject>& Params);
+
+    // Procedural road network generation (FProceduralRoadGen)
+    TSharedPtr<FJsonObject> HandleGenerateProceduralRoads(const TSharedPtr<FJsonObject>& Params);
+
+    // Sidewalk theming
+    TSharedPtr<FJsonObject> HandleListSidewalkPresets(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetRoadSidewalk(const TSharedPtr<FJsonObject>& Params);
+
+    // Landscape conformation
+    TSharedPtr<FJsonObject> HandleConformLandscapeToRoads(const TSharedPtr<FJsonObject>& Params);
 };

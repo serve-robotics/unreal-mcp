@@ -100,4 +100,19 @@ private:
 	void OnGISVectorRoadsFailed(const FString& ErrorMessage, int32 ErrorCode);
 
 	void StartVectorRoadsImport(const TSharedPtr<FJsonObject>& Params);
+
+	// Polls every 1 s until RoadGeo actor count stabilises — signals rebuild is done.
+	bool PollRoadRebuildComplete(float DeltaTime);
+	FTSTicker::FDelegateHandle RoadRebuildTickerHandle;
+	FString  PendingVectorRoadsResult;
+	int32    LastRoadGeoCount   = -1;
+	int32    RoadGeoStableFrames = 0;
+
+	// Permanent 2-second watchdog: disables autosave whenever RoadGeo count is changing
+	// (i.e. any RebuildRoadNetworkIncremental is in flight, regardless of trigger source),
+	// re-enables after 60 consecutive stable seconds. Runs for the lifetime of the subsystem.
+	bool WatchdogTickRoadRebuild(float DeltaTime);
+	FTSTicker::FDelegateHandle WatchdogTickerHandle;
+	int32 WatchdogLastRoadGeoCount = -1;
+	int32 WatchdogStableChecks     = 0;
 };

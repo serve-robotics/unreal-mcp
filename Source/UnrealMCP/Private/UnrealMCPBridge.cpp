@@ -73,12 +73,18 @@
 #include "Anchor/ServeGeoAnchor.h"
 #include "Types/ServeGISTypes.h"
 #include "Landscape.h" // full ALandscape definition (needed for CreatedLandscapes access)
+#include "LandscapeProxy.h"
+#include "LandscapeSplinesComponent.h"
+#include "LandscapeSplineActor.h"
 
 // RoadBLD — for road creation from vector shapes
 #include "DynamicRoad/DynamicRoad.h"
 #include "DynamicRoad/DynamicRoadNetwork.h"
+#include "RoadGeo.h"
 #include "Roads/ServeGISRoadStyleTable.h"
 #include "GISViewer/ServeGISRoadImportUtils.h"
+#include "Containers/Ticker.h"
+#include "Settings/EditorLoadingSavingSettings.h"
 
 DEFINE_LOG_CATEGORY(LogUnrealMCP);
 
@@ -130,6 +136,14 @@ void UUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
         CLIBridge = MakeUnique<FUnrealMCPCLIBridge>(this);
         CLIBridge->Start();
     }
+
+    // Start the permanent autosave watchdog. Fires every 2 s; disables autosave any time
+    // RoadGeo actor count is changing (rebuild in flight from any source), re-enables after
+    // 60 s of stability. This guards against all rebuild triggers, not just our own commands.
+    WatchdogTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateUObject(this, &UUnrealMCPBridge::WatchdogTickRoadRebuild),
+        2.0f);
+    UE_LOG(LogUnrealMCP, Display, TEXT("UnrealMCPBridge: autosave watchdog started"));
 }
 
 // Clean up resources when subsystem is destroyed
@@ -140,6 +154,11 @@ void UUnrealMCPBridge::Deinitialize()
     {
         CLIBridge->Stop();
         CLIBridge.Reset();
+    }
+    if (WatchdogTickerHandle.IsValid())
+    {
+        FTSTicker::GetCoreTicker().RemoveTicker(WatchdogTickerHandle);
+        WatchdogTickerHandle.Reset();
     }
     StopServer();
 }
@@ -761,12 +780,15 @@ void UUnrealMCPBridge::OnGISVectorRoadsSucceeded()
             TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
             FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
 
-            if (PendingVectorRoadsPromise.IsValid())
-            {
-                PendingVectorRoadsPromise->SetValue(Out);
-                PendingVectorRoadsPromise.Reset();
-            }
-        });
+    // Rebuild is intentionally NOT triggered here.
+    // gis_rebuild_road_networks uses RebuildRoadNetworkIncremental's OnComplete
+    // callback to block until workers are truly done, preventing the
+    // FArchiveGatherExternalActorRefs data race that caused save-time SIGSEGVs.
+    if (PendingVectorRoadsPromise.IsValid())
+    {
+        PendingVectorRoadsPromise->SetValue(Out);
+        PendingVectorRoadsPromise.Reset();
+    }
 }
 
 void UUnrealMCPBridge::OnGISVectorRoadsFailed(const FString& ErrorMessage, int32 ErrorCode)
@@ -791,6 +813,90 @@ void UUnrealMCPBridge::OnGISVectorRoadsFailed(const FString& ErrorMessage, int32
         PendingVectorRoadsPromise->SetValue(Out);
         PendingVectorRoadsPromise.Reset();
     }
+}
+
+bool UUnrealMCPBridge::PollRoadRebuildComplete(float /*DeltaTime*/)
+{
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World) return true; // keep ticking
+
+    TArray<AActor*> GeoActors;
+    UGameplayStatics::GetAllActorsOfClass(World, ARoadGeo::StaticClass(), GeoActors);
+    const int32 CurrentCount = GeoActors.Num();
+
+    if (CurrentCount > 0 && CurrentCount == LastRoadGeoCount)
+    {
+        RoadGeoStableFrames++;
+        // Require 60 consecutive stable 1-second ticks before resolving.
+        //
+        // "Count stable" means no new RoadGeo actors are being spawned, but
+        // RebuildRoadNetworkIncremental worker threads AND ULandscapeMirrorSplineBase::
+        // RefreshMirrorSpline calls may still be modifying ULandscapeSplineControlPoint /
+        // ULandscapeSplineSegment objects.  FArchiveGatherExternalActorRefs (triggered
+        // by any level save) serializes those objects; a concurrent write → SIGSEGV.
+        // Additionally, gis_build_zone_graph can re-trigger the rebuild; callers should
+        // call gis_rebuild_road_networks again after ZoneGraph to drain that second wave.
+        // 60 s of post-count-stability quiescence is conservative but safe.
+        if (RoadGeoStableFrames >= 60)
+        {
+            if (PendingVectorRoadsPromise.IsValid())
+            {
+                PendingVectorRoadsPromise->SetValue(PendingVectorRoadsResult);
+                PendingVectorRoadsPromise.Reset();
+            }
+            PendingVectorRoadsResult.Empty();
+            RoadRebuildTickerHandle.Reset();
+            return false; // stop ticking
+        }
+    }
+    else
+    {
+        RoadGeoStableFrames = 0;
+    }
+    LastRoadGeoCount = CurrentCount;
+    return true; // keep ticking
+}
+
+bool UUnrealMCPBridge::WatchdogTickRoadRebuild(float /*DeltaTime*/)
+{
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World) return true;
+
+    TArray<AActor*> GeoActors;
+    UGameplayStatics::GetAllActorsOfClass(World, ARoadGeo::StaticClass(), GeoActors);
+    const int32 CurrentCount = GeoActors.Num();
+
+    if (WatchdogLastRoadGeoCount < 0)
+    {
+        // First tick — initialise without acting.
+        WatchdogLastRoadGeoCount = CurrentCount;
+        return true;
+    }
+
+    UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>();
+
+    if (CurrentCount != WatchdogLastRoadGeoCount)
+    {
+        WatchdogLastRoadGeoCount = CurrentCount;
+        WatchdogStableChecks = 0;
+        if (Cfg && Cfg->bAutoSaveEnable)
+        {
+            Cfg->bAutoSaveEnable = false;
+            UE_LOG(LogUnrealMCP, Log, TEXT("Watchdog: RoadGeo count changed to %d — autosave disabled"), CurrentCount);
+        }
+    }
+    else
+    {
+        WatchdogStableChecks++;
+        // 30 ticks × 2 s = 60 s stable
+        if (WatchdogStableChecks == 30 && Cfg && !Cfg->bAutoSaveEnable)
+        {
+            Cfg->bAutoSaveEnable = true;
+            UE_LOG(LogUnrealMCP, Log, TEXT("Watchdog: RoadGeo stable at %d for 60 s — autosave re-enabled"), CurrentCount);
+        }
+    }
+
+    return true; // always keep ticking
 }
 
 void UUnrealMCPBridge::StartVectorRoadsImport(const TSharedPtr<FJsonObject>& Params)
@@ -932,6 +1038,176 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         PendingGISPromise->SetValue(Out);
         PendingGISPromise.Reset();
         return Out;
+    }
+
+    // gis_rebuild_road_networks: wait for the in-progress road rebuild commit to finish.
+    // gis_import_vector_roads triggers a rebuild and returns immediately — call this
+    // before gis_generate_block_shapes to ensure RoadGeo actors (with collision) exist.
+    // Polls every 1 s until RoadGeo count has been stable for 3 consecutive readings.
+    if (CommandType == TEXT("gis_rebuild_road_networks"))
+    {
+        if (PendingVectorRoadsPromise.IsValid())
+        {
+            TSharedPtr<FJsonObject> Err = MakeShared<FJsonObject>();
+            Err->SetStringField(TEXT("status"), TEXT("error"));
+            Err->SetStringField(TEXT("error"), TEXT("gis_rebuild_road_networks: road import or rebuild already in progress"));
+            FString Out;
+            TSharedRef<TJsonWriter<>> W2 = TJsonWriterFactory<>::Create(&Out);
+            FJsonSerializer::Serialize(Err.ToSharedRef(), W2);
+            return Out;
+        }
+
+        PendingVectorRoadsPromise = MakeShared<TPromise<FString>>();
+        TFuture<FString> RebuildFuture = PendingVectorRoadsPromise->GetFuture();
+
+        // Build success result upfront; PollRoadRebuildComplete delivers it when stable.
+        TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+        R->SetBoolField(TEXT("success"), true);
+        TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+        Resp->SetStringField(TEXT("status"), TEXT("success"));
+        Resp->SetObjectField(TEXT("result"), R);
+        FString SuccessOut;
+        TSharedRef<TJsonWriter<>> W3 = TJsonWriterFactory<>::Create(&SuccessOut);
+        FJsonSerializer::Serialize(Resp.ToSharedRef(), W3);
+
+        // Find the road network and trigger rebuild with the OnComplete callback.
+        // OnComplete fires when ALL worker threads have truly finished modifying
+        // ULandscapeSplineControlPoint / ULandscapeSplineSegment objects.
+        // Only after OnComplete is it safe to re-enable autosave.
+        AsyncTask(ENamedThreads::GameThread, [this, SuccessOut]()
+        {
+            // Ensure autosave is off for the rebuild duration (may already be off from
+            // gis_generate_procedural_roads or gis_build_zone_graph; belt-and-suspenders).
+            if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+                Cfg->bAutoSaveEnable = false;
+
+            UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+
+            ADynamicRoadNetwork* Network = nullptr;
+            if (World)
+            {
+                for (TActorIterator<ADynamicRoadNetwork> It(World); It; ++It)
+                {
+                    if (IsValid(*It)) { Network = *It; break; }
+                }
+            }
+
+            if (!Network)
+            {
+                // No road network in scene — nothing to rebuild; resolve immediately.
+                // Re-enable autosave now since there are no workers to wait for.
+                if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+                {
+                    Cfg->bAutoSaveEnable = true;
+                    UE_LOG(LogUnrealMCP, Log, TEXT("gis_rebuild_road_networks: no network, autosave re-enabled"));
+                }
+                if (PendingVectorRoadsPromise.IsValid())
+                {
+                    PendingVectorRoadsPromise->SetValue(SuccessOut);
+                    PendingVectorRoadsPromise.Reset();
+                }
+                return;
+            }
+
+            // The 5-arg overload fires OnComplete when workers are truly done.
+            // Clear landscape splines and re-enable autosave on game thread, then
+            // fulfill the promise — ensures saves are safe before callers proceed.
+            Network->RebuildRoadNetworkIncremental({}, {}, false, false,
+                [this, SuccessOut]()
+                {
+                    // OnComplete may fire on a background thread; dispatch to game thread
+                    // for UObject modifications and promise fulfillment.
+                    AsyncTask(ENamedThreads::GameThread, [this, SuccessOut]()
+                    {
+                        // Destroy all landscape spline data to prevent FArchiveGatherExternalActorRefs
+                        // from stack-overflowing on the cyclic ControlPoint↔Segment ring graph
+                        // during World Partition saves. Road geometry lives in ARoadGeo static meshes;
+                        // landscape splines are only used for terrain deformation and are safe to
+                        // discard after rebuild. Two spline storage paths must be cleared:
+                        //   1. ALandscapeSplineActor (UE5 WP-style standalone spline actors)
+                        //   2. ULandscapeSplinesComponent on ALandscapeProxy actors (legacy path)
+                        if (UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+                        {
+                            // Path 1: destroy ALandscapeSplineActor actors (the primary culprit —
+                            // these are NOT ALandscapeProxy subclasses and were missed by the
+                            // previous ALandscapeProxy iterator, leaving their ring graph intact).
+                            TArray<ALandscapeSplineActor*> SplineActors;
+                            for (TActorIterator<ALandscapeSplineActor> It(W); It; ++It)
+                            {
+                                if (IsValid(*It)) SplineActors.Add(*It);
+                            }
+                            for (ALandscapeSplineActor* SA : SplineActors)
+                            {
+                                UE_LOG(LogUnrealMCP, Log,
+                                    TEXT("gis_rebuild_road_networks: destroying ALandscapeSplineActor %s"),
+                                    *SA->GetName());
+                                SA->Destroy();
+                            }
+
+                            // Path 2: clear ULandscapeSplinesComponent arrays on ALandscapeProxy actors.
+                            for (TActorIterator<ALandscapeProxy> It(W); It; ++It)
+                            {
+                                if (!IsValid(*It)) continue;
+                                if (ULandscapeSplinesComponent* SC = It->GetSplinesComponent())
+                                {
+                                    if (SC->HasAnyControlPointsOrSegments())
+                                    {
+                                        SC->Modify();
+                                        SC->GetControlPoints().Empty();
+                                        SC->GetSegments().Empty();
+                                        UE_LOG(LogUnrealMCP, Log,
+                                            TEXT("gis_rebuild_road_networks: cleared legacy splines on %s"),
+                                            *It->GetName());
+                                    }
+                                }
+                            }
+                        }
+
+                        if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+                        {
+                            Cfg->bAutoSaveEnable = true;
+                            UE_LOG(LogUnrealMCP, Log, TEXT("gis_rebuild_road_networks: workers done, autosave re-enabled"));
+                        }
+
+                        if (PendingVectorRoadsPromise.IsValid())
+                        {
+                            PendingVectorRoadsPromise->SetValue(SuccessOut);
+                            PendingVectorRoadsPromise.Reset();
+                        }
+                    });
+                });
+        });
+
+        constexpr float PollSec  = 0.1f;
+        constexpr float LimitSec = 900.f; // 15 min — generous for large networks
+        for (float Elapsed = 0.f; Elapsed < LimitSec; Elapsed += PollSec)
+        {
+            if (RebuildFuture.IsReady()) return RebuildFuture.Get();
+            FPlatformProcess::Sleep(PollSec);
+        }
+
+        // Timeout — re-enable autosave so the editor isn't left with it permanently off.
+        AsyncTask(ENamedThreads::GameThread, []()
+        {
+            if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+            {
+                Cfg->bAutoSaveEnable = true;
+                UE_LOG(LogUnrealMCP, Log, TEXT("gis_rebuild_road_networks: timeout, autosave re-enabled"));
+            }
+        });
+
+        TSharedPtr<FJsonObject> T = MakeShared<FJsonObject>();
+        T->SetStringField(TEXT("status"), TEXT("error"));
+        T->SetStringField(TEXT("error"), TEXT("gis_rebuild_road_networks timed out after 900 s"));
+        FString Tout;
+        TSharedRef<TJsonWriter<>> Wt = TJsonWriterFactory<>::Create(&Tout);
+        FJsonSerializer::Serialize(T.ToSharedRef(), Wt);
+        if (PendingVectorRoadsPromise.IsValid())
+        {
+            PendingVectorRoadsPromise->SetValue(Tout);
+            PendingVectorRoadsPromise.Reset();
+        }
+        return Tout;
     }
 
     // take_screenshot: fire HighResShot on game thread, poll for the file here so
@@ -1218,18 +1494,44 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         try
         {
             TSharedPtr<FJsonObject> ResultJson;
-            
+
+            // Block actor-modifying commands while a road rebuild is in flight.
+            // ULandscapeSplineSegment::Serialize crashes when World Partition gathers
+            // external actor refs (triggered by spawning/destroying actors) while
+            // RebuildRoadNetworkIncremental workers are still touching spline data.
+            static const TSet<FString> RebuildSafeCommands = {
+                TEXT("ping"), TEXT("get_actors_in_level"), TEXT("find_actors_by_name"),
+                TEXT("get_actor_properties"), TEXT("focus_viewport"),
+                TEXT("gis_rebuild_road_networks"), TEXT("gis_import_landscape"),
+                TEXT("gis_import_vector_roads"), TEXT("gis_viewer_clear"),
+                TEXT("gis_viewer_load_file"), TEXT("gis_viewer_list_layers"),
+            };
+            if (PendingVectorRoadsPromise.IsValid() && !RebuildSafeCommands.Contains(CommandType))
+            {
+                ResultJson = MakeShareable(new FJsonObject);
+                ResultJson->SetBoolField(TEXT("success"), false);
+                ResultJson->SetStringField(TEXT("error"),
+                    TEXT("road rebuild in progress — retry after gis_rebuild_road_networks succeeds"));
+                ResponseJson->SetStringField(TEXT("status"), TEXT("error"));
+                ResponseJson->SetObjectField(TEXT("result"), ResultJson);
+                FString RebuildBusyOut;
+                TSharedRef<TJsonWriter<>> RBW = TJsonWriterFactory<>::Create(&RebuildBusyOut);
+                FJsonSerializer::Serialize(ResponseJson.ToSharedRef(), RBW);
+                Promise.SetValue(RebuildBusyOut);
+                return;
+            }
+
             if (CommandType == TEXT("ping"))
             {
                 ResultJson = MakeShareable(new FJsonObject);
                 ResultJson->SetStringField(TEXT("message"), TEXT("pong"));
             }
             // Editor Commands (including actor manipulation)
-            else if (CommandType == TEXT("get_actors_in_level") || 
+            else if (CommandType == TEXT("get_actors_in_level") ||
                      CommandType == TEXT("find_actors_by_name") ||
                      CommandType == TEXT("spawn_actor") ||
                      CommandType == TEXT("create_actor") ||
-                     CommandType == TEXT("delete_actor") || 
+                     CommandType == TEXT("delete_actor") ||
                      CommandType == TEXT("set_actor_transform") ||
                      CommandType == TEXT("get_actor_properties") ||
                      CommandType == TEXT("set_actor_property") ||
@@ -1300,12 +1602,19 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_screenshot_markers") ||
                      // TODO(rename): gis_build_zone_graph -> roadnet_build_zone_graph
                      CommandType == TEXT("gis_build_zone_graph") ||
-                     // Road-network diagnostics (no GIS dependency)
-                     CommandType == TEXT("roadnet_summarize_semantic") ||
-                     CommandType == TEXT("roadnet_summarize_lane_graph") ||
-                     CommandType == TEXT("roadnet_validate") ||
-                     CommandType == TEXT("roadnet_reconcile") ||
-                     CommandType == TEXT("roadnet_list_markers"))
+                     CommandType == TEXT("gis_summarize_road_network_semantic") ||
+                     CommandType == TEXT("gis_summarize_lane_graph") ||
+                     CommandType == TEXT("gis_validate_road_network") ||
+                     CommandType == TEXT("gis_reconcile_road_network") ||
+                     CommandType == TEXT("gis_list_report_markers") ||
+                     CommandType == TEXT("gis_list_districts") ||
+                     CommandType == TEXT("gis_generate_block_shapes") ||
+                     CommandType == TEXT("gis_assign_district") ||
+                     CommandType == TEXT("gis_generate_buildings") ||
+                     CommandType == TEXT("gis_generate_procedural_roads") ||
+                     CommandType == TEXT("gis_list_sidewalk_presets") ||
+                     CommandType == TEXT("gis_set_road_sidewalk") ||
+                     CommandType == TEXT("gis_conform_landscape_to_roads"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);
             }

@@ -1,5 +1,7 @@
 #include "Commands/UnrealMCPGISCommands.h"
 #include "Commands/UnrealMCPCommonUtils.h"
+#include "CityGenerationUtils.h"
+#include "ProceduralRoadGen.h"
 
 #include "Editor.h"
 #include "TempoRoadLaneGraphSubsystem.h"
@@ -12,6 +14,8 @@
 #include "Landscape.h"
 #include "LandscapeProxy.h"
 #include "LandscapeStreamingProxy.h"
+#include "LandscapeSplineActor.h"
+#include "LandscapeSplinesComponent.h"
 #include "LevelEditor.h"
 #include "ILevelEditor.h"
 #include "SLevelViewport.h"
@@ -28,10 +32,13 @@
 
 // RoadBLD
 #include "DynamicRoad/DynamicRoadNetwork.h"
+#include "DynamicRoad/DynamicRoad.h"
 #include "DynamicRoad/DynamicRoadData.h"
 #include "DynamicRoad/DynamicRoadIntersection.h"
+#include "DynamicRoad/ClothoidSplineComponent.h"
 
 #include "Engine/Blueprint.h"
+#include "Settings/EditorLoadingSavingSettings.h"
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -93,6 +100,20 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     // --- Editor-viewport visualization: pure UI (show flags + framed capture), no GIS ---
     if (CommandType == TEXT("viewport_screenshot_zone_graph")) return HandleScreenshotZoneGraph(Params);
 
+    // City block and building generation
+    if (CommandType == TEXT("gis_list_districts"))       return HandleListDistricts(Params);
+    if (CommandType == TEXT("gis_generate_block_shapes")) return HandleGenerateBlockShapes(Params);
+    if (CommandType == TEXT("gis_assign_district"))      return HandleAssignDistrict(Params);
+    if (CommandType == TEXT("gis_generate_buildings"))   return HandleGenerateBuildings(Params);
+    if (CommandType == TEXT("gis_generate_procedural_roads")) return HandleGenerateProceduralRoads(Params);
+
+    // Sidewalk theming
+    if (CommandType == TEXT("gis_list_sidewalk_presets")) return HandleListSidewalkPresets(Params);
+    if (CommandType == TEXT("gis_set_road_sidewalk"))     return HandleSetRoadSidewalk(Params);
+
+    // Landscape conformation
+    if (CommandType == TEXT("gis_conform_landscape_to_roads")) return HandleConformLandscapeToRoads(Params);
+
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
 }
@@ -101,11 +122,46 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
 // gis_create_level
 // ---------------------------------------------------------------------------
 
-// Built-in Open World template: WorldPartition + landscape + sky/lighting already configured. New
-// towns clone this so roads have terrain to snap to and each town is a fully self-contained level —
-// which also gives procedural generation a guaranteed-total reset (a fresh level, not an in-place
-// sweep that can miss ZoneGraph/intersection/block actors).
+// Built-in Open World template: WorldPartition + landscape + sky/lighting already configured.
 static const TCHAR* kDefaultLevelTemplate = TEXT("/Engine/Maps/Templates/OpenWorld");
+
+// Break the cyclic ControlPoint<->Segment ring graph on all landscape spline data in
+// the current world. Must be called before loading a new level to avoid
+// FArchiveGatherExternalActorRefs stack-overflowing during world destruction.
+//
+// We clear the CP/segment arrays rather than calling Destroy() on the actors.
+// Destroy() during an MCP game-thread tick task modifies ALandscapeSplineActor tick
+// registration, which then collides with the TickTaskManager state during the subsequent
+// NewLevelFromTemplate, triggering a !LevelList.Contains(TickTaskLevel) assertion crash.
+static void ClearLandscapeSplineGraph(UWorld* World)
+{
+    if (!IsValid(World)) return;
+
+    // Path 1: ALandscapeSplineActor (UE5 WP-style standalone spline actors).
+    for (TActorIterator<ALandscapeSplineActor> It(World); It; ++It)
+    {
+        if (!IsValid(*It)) continue;
+        if (ULandscapeSplinesComponent* SC = (*It)->GetSplinesComponent())
+        {
+            SC->GetControlPoints().Empty();
+            SC->GetSegments().Empty();
+        }
+    }
+
+    // Path 2: ULandscapeSplinesComponent on ALandscapeProxy actors (legacy path).
+    for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+    {
+        if (!IsValid(*It)) continue;
+        if (ULandscapeSplinesComponent* SC = It->GetSplinesComponent())
+        {
+            if (SC->HasAnyControlPointsOrSegments())
+            {
+                SC->GetControlPoints().Empty();
+                SC->GetSegments().Empty();
+            }
+        }
+    }
+}
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPtr<FJsonObject>& Params)
 {
@@ -117,16 +173,15 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
     if (!LES)
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_create_level: LevelEditorSubsystem unavailable"));
 
-    // Optional template. Defaults to the Open World template so a new level ships with landscape +
-    // lighting. Pass template_path:"" (empty) to explicitly request a truly blank level instead.
-    // Pass strip_landscape:true to delete the template's landscape after cloning (GIS levels import
-    // their own terrain) — see the strip block below.
+    // Optional template. Defaults to the Open World template. Pass template_path:"open_world" or the
+    // full engine path. Pass template_path:"" (empty) for a truly blank level.
     FString TemplatePath = kDefaultLevelTemplate;
     Params->TryGetStringField(TEXT("template_path"), TemplatePath);
+    if (TemplatePath.Equals(TEXT("open_world"), ESearchCase::IgnoreCase))
+        TemplatePath = TEXT("/Engine/Maps/Templates/OpenWorld");
 
-    // NewLevel/NewLevelFromTemplate refuse to overwrite an existing asset ("Failed to validate the
-    // destination"). For regenerate-to-a-fixed-name workflows, pass overwrite:true to delete the
-    // existing level first. (Default false so a typo can't silently nuke a level.)
+    // NewLevel/NewLevelFromTemplate refuse to overwrite an existing asset. Pass overwrite:true to
+    // delete the existing level first. (Default false so a typo can't silently nuke a level.)
     bool bOverwrite = false;
     Params->TryGetBoolField(TEXT("overwrite"), bOverwrite);
     bool bDeletedExisting = false;
@@ -136,10 +191,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
             return FUnrealMCPCommonUtils::CreateErrorResponse(
                 FString::Printf(TEXT("gis_create_level: '%s' already exists (pass overwrite:true to replace it)"), *LevelPath));
 
-        // DeleteAsset fails if the target level's package is still referenced — most commonly because
-        // it's the currently-open world (a regenerate-to-a-fixed-name run reuses the same path). Move
-        // off it onto a throwaway blank level FIRST so nothing holds the package open, then delete.
-        // NewLevel("") creates an unsaved /Temp map (same as File > New Level), releasing the target.
+        // Move off the current level first if it's the target, so nothing holds the package open.
         if (UWorld* CurrentWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
         {
             const FString CurrentPkg = CurrentWorld->GetOutermost()->GetName();
@@ -157,6 +209,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
         bDeletedExisting = true;
     }
 
+    // Break the landscape spline ring graph before loading the new level.
+    // Without this, EditorDestroyWorld hits FArchiveGatherExternalActorRefs recursion on
+    // the cyclic ControlPoint<->Segment graph left behind by RebuildRoadNetworkIncremental.
+    ClearLandscapeSplineGraph(GEditor ? GEditor->GetEditorWorldContext().World() : nullptr);
+
     bool bOk;
     if (TemplatePath.IsEmpty())
     {
@@ -173,11 +230,18 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
                 *LevelPath,
                 TemplatePath.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" from template '%s'"), *TemplatePath)));
 
-    // Optionally strip the template's landscape. The Open World template ships its own ALandscape
-    // (plus WorldPartition streaming proxies). GIS levels import their OWN terrain via
+    // Always disable OFPA (One File Per Actor) so all actors live in the main package.
+    // With OFPA on, saving triggers FArchiveGatherExternalActorRefs which recursively
+    // serializes ULandscapeSplineSegment/ULandscapeSplineControlPoint cycles (ring graph
+    // from the road rebuild) and stack-overflows. Actors are still WP-streamable without
+    // OFPA; streaming is cell-based, not file-based.
+    if (UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+        if (ULevel* Level = World->GetCurrentLevel())
+            Level->bUseExternalActors = false;
+
+    // Optionally strip the template's landscape. GIS levels import their own terrain via
     // gis_import_landscape, so keeping the template landscape leaves two overlapping landscapes.
-    // Opt-in (default off) because the create-grid-level workflow deliberately reuses the template
-    // landscape as its flat terrain — only the GIS create-level SOP wants this stripped.
+    // Opt-in (default off) — procedural levels reuse the template landscape as their terrain.
     int32 StrippedLandscapes = 0;
     bool bStripLandscape = false;
     Params->TryGetBoolField(TEXT("strip_landscape"), bStripLandscape);
@@ -185,9 +249,6 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
     {
         if (UWorld* World = GetEditorWorld())
         {
-            // ALandscapeProxy is the common base of ALandscape and ALandscapeStreamingProxy, so one
-            // pass over it catches the whole WP landscape. Collect first, then destroy (don't mutate
-            // the level while an actor iterator is live).
             TArray<ALandscapeProxy*> ToDestroy;
             for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
             {
@@ -1019,6 +1080,17 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleBuildZoneGraph(const TShare
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             TEXT("gis_build_zone_graph: UTempoRoadLaneGraphSubsystem unavailable — is TempoAgents enabled?"));
 
+    // Disable autosave while ZoneGraph runs.  DetectAndStoreEdgeIntersections /
+    // CreatePerimeterCuts read road spline geometry, which can trigger mirror-spline
+    // refreshes that re-fire RebuildRoadNetworkIncremental in the background.
+    // A concurrent autosave would race with those workers on the spline objects.
+    // gis_rebuild_road_networks (step 7.5) re-enables autosave after the rebuild drains.
+    if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+    {
+        Cfg->bAutoSaveEnable = false;
+        UE_LOG(LogUnrealMCP, Log, TEXT("gis_build_zone_graph: autosave disabled until post-ZoneGraph rebuild drains"));
+    }
+
     // Step 1: ensure perimeter cuts are up-to-date on all road networks.
     // The modern async rebuild (RebuildRoadNetworkIncremental) stores its intersection data
     // in a temporary FRebuildContext and never writes to the legacy RoadNetworkCorners /
@@ -1559,6 +1631,431 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListReportMarkers(
     R->SetBoolField  (TEXT("success"),      true);
     R->SetNumberField(TEXT("marker_count"), Markers.Num());
     R->SetArrayField (TEXT("markers"),      MarkerArr);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_list_districts
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListDistricts(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    TArray<TSharedPtr<FJsonValue>> DistrictArr;
+    for (const FCityGenerationUtils::FDistrictInfo& Info : FCityGenerationUtils::ListDistricts())
+    {
+        auto J = MakeShared<FJsonObject>();
+        J->SetStringField(TEXT("name"),       Info.DisplayName);
+        J->SetStringField(TEXT("class_name"), Info.ClassName);
+        DistrictArr.Add(MakeShared<FJsonValueObject>(J));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),        true);
+    R->SetNumberField(TEXT("district_count"), DistrictArr.Num());
+    R->SetArrayField (TEXT("districts"),      DistrictArr);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_generate_block_shapes
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateBlockShapes(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_generate_block_shapes: no editor world available"));
+
+    FString Error;
+    if (!FCityGenerationUtils::GenerateBlockShapes(World, Error))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_block_shapes: %s"), *Error));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"), true);
+    R->SetStringField(TEXT("message"), TEXT("Block shapes generated"));
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_assign_district
+// Params: district (string — display name or class name, required)
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleAssignDistrict(const TSharedPtr<FJsonObject>& Params)
+{
+    FString DistrictName;
+    if (!Params->TryGetStringField(TEXT("district"), DistrictName) || DistrictName.IsEmpty())
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_assign_district: 'district' param required (display name or class name). "
+                 "Use gis_list_districts to see available values."));
+
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_assign_district: no editor world available"));
+
+    FString Error;
+    UClass* DistrictClass = FCityGenerationUtils::FindDistrictClass(DistrictName, Error);
+    if (!DistrictClass)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_assign_district: %s"), *Error));
+
+    int32 Count = 0;
+    if (!FCityGenerationUtils::AssignDistrictToAllBlocks(World, DistrictClass, Count, Error))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_assign_district: %s"), *Error));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),        true);
+    R->SetStringField(TEXT("district"),       DistrictName);
+    R->SetNumberField(TEXT("blocks_assigned"), Count);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_generate_buildings
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateBuildings(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_generate_buildings: no editor world available"));
+
+    int32 Generated = 0, Skipped = 0;
+    FString Error;
+    if (!FCityGenerationUtils::GenerateBuildingsForAllBlocks(World, Generated, Skipped, Error))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_buildings: %s"), *Error));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),           true);
+    R->SetNumberField(TEXT("blocks_generated"),  Generated);
+    R->SetNumberField(TEXT("blocks_skipped"),    Skipped);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_generate_procedural_roads
+// Params: seed (int, optional, default 42)
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateProceduralRoads(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_generate_procedural_roads: no editor world available"));
+
+    int32   Seed        = 42;
+    FString Topology    = TEXT("ring_branch");
+    float   RingCluster = 3.0f;
+    if (Params.IsValid())
+    {
+        double SeedD = 42.0;
+        if (Params->TryGetNumberField(TEXT("seed"), SeedD))
+            Seed = static_cast<int32>(SeedD);
+        FString TopologyStr;
+        if (Params->TryGetStringField(TEXT("topology"), TopologyStr) && !TopologyStr.IsEmpty())
+            Topology = TopologyStr;
+        double ClusterD = 3.0;
+        if (Params->TryGetNumberField(TEXT("ring_cluster"), ClusterD))
+            RingCluster = FMath::Max(1.0f, static_cast<float>(ClusterD));
+    }
+
+    // Disable autosave for the duration of the road rebuild.  RebuildRoadNetworkIncremental
+    // runs worker threads that write ULandscapeSplineControlPoint / ULandscapeSplineSegment;
+    // FArchiveGatherExternalActorRefs (invoked by any save, including autosave) serializes
+    // those same objects on the game thread → data race → SIGSEGV.
+    // Callers MUST follow with gis_rebuild_road_networks; that command re-enables autosave
+    // only after the OnComplete callback confirms all workers have finished.
+    if (UEditorLoadingSavingSettings* Cfg = GetMutableDefault<UEditorLoadingSavingSettings>())
+    {
+        Cfg->bAutoSaveEnable = false;
+        UE_LOG(LogUnrealMCP, Log, TEXT("gis_generate_procedural_roads: autosave disabled until rebuild completes"));
+    }
+
+    FString Message;
+    FProceduralRoadGen::Generate(World, Seed, Topology, RingCluster, Message);
+
+    // Generate sets an error-like message when it aborts early (starts with "No ").
+    if (Message.StartsWith(TEXT("No ")) || Message.StartsWith(TEXT("Failed")))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_procedural_roads: %s"), *Message));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),      true);
+    R->SetStringField(TEXT("message"),      Message);
+    R->SetNumberField(TEXT("seed"),         Seed);
+    R->SetStringField(TEXT("topology"),     Topology);
+    R->SetNumberField(TEXT("ring_cluster"), RingCluster);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_list_sidewalk_presets
+// Lists all URoadBLDSidewalkPreset Blueprint subclasses found under
+// /Game/RoadModules/Sidewalks/ and their theme classification.
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListSidewalkPresets(
+    const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    IAssetRegistry& AR =
+        FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+
+    FARFilter Filter;
+    Filter.PackagePaths.Add(FName("/Game/RoadModules/Sidewalks"));
+    Filter.PackagePaths.Add(FName("/RoadBLD"));
+    Filter.bRecursivePaths = true;
+    Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+
+    TArray<FAssetData> Assets;
+    AR.GetAssets(Filter, Assets);
+
+    TArray<TSharedPtr<FJsonValue>> Presets;
+    for (const FAssetData& AD : Assets)
+    {
+        // Build the _C class path (<PackageName>.<AssetName>_C) and load.
+        // Using PackageName (not GetObjectPathString which is already PackageName.AssetName).
+        const FString ClassPath = FString::Printf(TEXT("%s.%s_C"),
+            *AD.PackageName.ToString(), *AD.AssetName.ToString());
+        UClass* PresetClass = LoadClass<URoadBLDSidewalkPreset>(nullptr, *ClassPath);
+        if (!PresetClass) continue; // not a URoadBLDSidewalkPreset subclass
+
+        const FString Pkg  = AD.PackageName.ToString();
+        FString Theme      = TEXT("other");
+        if (Pkg.Contains(TEXT("ModernCityDark"))) Theme = TEXT("dark");
+        else if (Pkg.Contains(TEXT("ModernCity"))) Theme = TEXT("modern");
+
+        auto P = MakeShared<FJsonObject>();
+        P->SetStringField(TEXT("name"),       AD.AssetName.ToString());
+        P->SetStringField(TEXT("class_path"), ClassPath);
+        P->SetStringField(TEXT("theme"),      Theme);
+        Presets.Add(MakeShared<FJsonValueObject>(P));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField (TEXT("success"),        true);
+    R->SetArrayField(TEXT("presets"),        Presets);
+    R->SetNumberField(TEXT("preset_count"),  Presets.Num());
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_set_road_sidewalk
+//
+// Applies a sidewalk preset to all (or one named) ADynamicRoad actors.
+//
+// Params:
+//   "sidewalk_preset" (string, required):
+//     "modern"  — random ModernCity variant
+//     "dark"    — random ModernCityDark variant
+//     "random"  — random from all available presets
+//     "/Game/…" — full Blueprint class path (with or without _C suffix)
+//   "road_name" (string, optional, default "all"):
+//     Actor label of a specific road to target, or "all" for all roads.
+//   "seed" (number, optional):
+//     Integer seed for reproducible random theme selection.
+//
+// Returns: success, applied_class, roads_updated count.
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetRoadSidewalk(
+    const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_set_road_sidewalk: no editor world available"));
+
+    // Parse params
+    FString PresetParam;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("sidewalk_preset"), PresetParam)
+        || PresetParam.IsEmpty())
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_set_road_sidewalk: sidewalk_preset required "
+                 "(\"modern\", \"dark\", \"random\", or full /Game/… class path)"));
+
+    FString TargetRoadName = TEXT("all");
+    if (Params.IsValid()) Params->TryGetStringField(TEXT("road_name"), TargetRoadName);
+
+    int32 Seed = FMath::Rand();
+    if (Params.IsValid())
+    {
+        double SeedD = 0.0;
+        if (Params->TryGetNumberField(TEXT("seed"), SeedD))
+            Seed = static_cast<int32>(SeedD);
+    }
+
+    // Theme keyword → resolve class path using the asset registry
+    FString ResolvedClassPath = PresetParam;
+
+    if (PresetParam == TEXT("modern") || PresetParam == TEXT("dark") ||
+        PresetParam == TEXT("random"))
+    {
+        IAssetRegistry& AR =
+            FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+
+        FARFilter Filter;
+        Filter.PackagePaths.Add(FName("/Game/RoadModules/Sidewalks"));
+        Filter.PackagePaths.Add(FName("/RoadBLD"));
+        Filter.bRecursivePaths  = true;
+        Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+
+        TArray<FAssetData> Assets;
+        AR.GetAssets(Filter, Assets);
+
+        TArray<FString> Pool;
+        for (const FAssetData& AD : Assets)
+        {
+            // LoadClass forces blueprint compilation; skip if not a URoadBLDSidewalkPreset subclass
+            const FString CPath = FString::Printf(TEXT("%s.%s_C"),
+                *AD.PackageName.ToString(), *AD.AssetName.ToString());
+            UClass* PC = LoadClass<URoadBLDSidewalkPreset>(nullptr, *CPath);
+            if (!PC) continue;
+
+            const FString Pkg = AD.PackageName.ToString();
+            bool bMatch = (PresetParam == TEXT("random"));
+            if (!bMatch && PresetParam == TEXT("modern"))
+                bMatch = Pkg.Contains(TEXT("ModernCity")) && !Pkg.Contains(TEXT("Dark"));
+            if (!bMatch && PresetParam == TEXT("dark"))
+                bMatch = Pkg.Contains(TEXT("ModernCityDark")) || Pkg.Contains(TEXT("Dark"));
+
+            if (bMatch)
+                Pool.Add(CPath);
+        }
+
+        if (Pool.IsEmpty())
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("gis_set_road_sidewalk: no presets found for theme \"%s\""),
+                    *PresetParam));
+
+        FRandomStream Rand(Seed);
+        ResolvedClassPath = Pool[Rand.RandRange(0, Pool.Num() - 1)];
+    }
+
+    // Ensure the class path has the _C suffix required for Blueprint generated classes
+    if (!ResolvedClassPath.EndsWith(TEXT("_C")))
+        ResolvedClassPath += TEXT("_C");
+
+    // Load the sidewalk preset class
+    UClass* PresetClass = LoadClass<URoadBLDSidewalkPreset>(nullptr, *ResolvedClassPath);
+    if (!PresetClass)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_set_road_sidewalk: could not load class \"%s\""),
+                *ResolvedClassPath));
+
+    // Apply to matching road actors
+    int32 Updated = 0;
+    for (TActorIterator<ADynamicRoad> It(World); It; ++It)
+    {
+        ADynamicRoad* Road = *It;
+        if (!IsValid(Road)) continue;
+
+        const bool bTargetAll  = TargetRoadName.IsEmpty() || TargetRoadName == TEXT("all");
+        const bool bNameMatch  = Road->GetActorLabel() == TargetRoadName;
+        if (!bTargetAll && !bNameMatch) continue;
+
+        Road->LeftSidewalkPreset  = PresetClass;
+        Road->RightSidewalkPreset = PresetClass;
+
+        // InitializeRoad regenerates the road's mesh/module geometry using the updated presets.
+        // Uses Road->SourceDrawPreset (the preset assigned at spawning time).
+        if (Road->SourceDrawPreset)
+        {
+            Road->InitializeRoad(Road->SourceDrawPreset, 0.0);
+        }
+        Road->MarkPackageDirty();
+        Updated++;
+    }
+
+    if (Updated == 0)
+    {
+        const bool bIsAll = TargetRoadName.IsEmpty() || TargetRoadName == TEXT("all");
+        const FString Err = bIsAll
+            ? TEXT("gis_set_road_sidewalk: no ADynamicRoad actors found in level")
+            : FString::Printf(TEXT("gis_set_road_sidewalk: no road named \"%s\" found"),
+                *TargetRoadName);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(Err);
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),       true);
+    R->SetStringField(TEXT("applied_class"), ResolvedClassPath);
+    R->SetNumberField(TEXT("roads_updated"), Updated);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_conform_landscape_to_roads
+// ---------------------------------------------------------------------------
+// Optional params:
+//   falloff_multiplier  (number, default 2.5)  — LandscapeFalloffMultiplier per road
+//   height_offset       (number, default -25.0) — landscape spline height offset in cm
+//                         applied to every control point; negative pushes terrain below road deck
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
+    const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (!World)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_conform_landscape_to_roads: no editor world"));
+    }
+
+    double FalloffMultiplier = 2.5;
+    double HeightOffsetCm    = -25.0;
+    if (Params.IsValid())
+    {
+        double V = 0.0;
+        if (Params->TryGetNumberField(TEXT("falloff_multiplier"), V)) FalloffMultiplier = V;
+        if (Params->TryGetNumberField(TEXT("height_offset"),      V)) HeightOffsetCm    = V;
+    }
+
+    int32 Conformed = 0;
+    int32 NoSpline  = 0;
+
+    for (TActorIterator<ADynamicRoad> It(World); It; ++It)
+    {
+        ADynamicRoad* Road = *It;
+        if (!IsValid(Road)) { continue; }
+
+        Road->bEnableLandscapeSplineMirroring = true;
+        Road->LandscapeFalloffMultiplier      = static_cast<float>(FalloffMultiplier);
+
+        // Apply per-point height offset so the landscape sits below the road deck
+        // rather than co-planar with it, preventing terrain poke-through on hills.
+        const int32 NumCPs = Road->ControlPoints.Num();
+        for (int32 i = 0; i < NumCPs; ++i)
+        {
+            Road->UpdatePointLandscapeMirrorHeightOffset(i, HeightOffsetCm);
+        }
+
+        if (UClothoidSplineComponent* Spline = Road->SplineComponent)
+        {
+            Spline->EnableSplineMirroring(true);
+            Spline->RebuildLandscapeSpline();
+            ++Conformed;
+        }
+        else
+        {
+            ++NoSpline;
+        }
+    }
+
+    if (Conformed == 0 && NoSpline == 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_conform_landscape_to_roads: no ADynamicRoad actors found in level"));
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),           true);
+    R->SetNumberField(TEXT("roads_conformed"),   Conformed);
+    R->SetNumberField(TEXT("roads_no_spline"),   NoSpline);
+    R->SetNumberField(TEXT("falloff_multiplier"), FalloffMultiplier);
+    R->SetNumberField(TEXT("height_offset_cm"),  HeightOffsetCm);
     return R;
 }
 
