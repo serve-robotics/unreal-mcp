@@ -10,6 +10,8 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "LevelEditorSubsystem.h"
 #include "Landscape.h"
+#include "LandscapeProxy.h"
+#include "LandscapeStreamingProxy.h"
 #include "LevelEditor.h"
 #include "ILevelEditor.h"
 #include "SLevelViewport.h"
@@ -117,6 +119,8 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
 
     // Optional template. Defaults to the Open World template so a new level ships with landscape +
     // lighting. Pass template_path:"" (empty) to explicitly request a truly blank level instead.
+    // Pass strip_landscape:true to delete the template's landscape after cloning (GIS levels import
+    // their own terrain) — see the strip block below.
     FString TemplatePath = kDefaultLevelTemplate;
     Params->TryGetStringField(TEXT("template_path"), TemplatePath);
 
@@ -169,12 +173,44 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPt
                 *LevelPath,
                 TemplatePath.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" from template '%s'"), *TemplatePath)));
 
+    // Optionally strip the template's landscape. The Open World template ships its own ALandscape
+    // (plus WorldPartition streaming proxies). GIS levels import their OWN terrain via
+    // gis_import_landscape, so keeping the template landscape leaves two overlapping landscapes.
+    // Opt-in (default off) because the create-grid-level workflow deliberately reuses the template
+    // landscape as its flat terrain — only the GIS create-level SOP wants this stripped.
+    int32 StrippedLandscapes = 0;
+    bool bStripLandscape = false;
+    Params->TryGetBoolField(TEXT("strip_landscape"), bStripLandscape);
+    if (bStripLandscape)
+    {
+        if (UWorld* World = GetEditorWorld())
+        {
+            // ALandscapeProxy is the common base of ALandscape and ALandscapeStreamingProxy, so one
+            // pass over it catches the whole WP landscape. Collect first, then destroy (don't mutate
+            // the level while an actor iterator is live).
+            TArray<ALandscapeProxy*> ToDestroy;
+            for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+            {
+                ToDestroy.Add(*It);
+            }
+            for (ALandscapeProxy* Proxy : ToDestroy)
+            {
+                if (IsValid(Proxy) && World->EditorDestroyActor(Proxy, /*bShouldModifyLevel=*/true))
+                {
+                    ++StrippedLandscapes;
+                }
+            }
+        }
+    }
+
     auto R = MakeShared<FJsonObject>();
     R->SetBoolField(TEXT("success"), true);
     R->SetStringField(TEXT("level_path"), LevelPath);
     if (!TemplatePath.IsEmpty())
         R->SetStringField(TEXT("template_path"), TemplatePath);
     R->SetBoolField(TEXT("overwrote_existing"), bDeletedExisting);
+    if (bStripLandscape)
+        R->SetNumberField(TEXT("stripped_landscapes"), StrippedLandscapes);
     return R;
 }
 

@@ -529,9 +529,12 @@ TArray<TSharedPtr<FJsonValue>> FUnrealMCPCLIBridge::BuildToolList()
 
     // ---- GIS commands ----
     Add(MakeTool(TEXT("gis_create_level"),
-        TEXT("Create a new empty UE level and open it. Tip: use /Game/Maps/<Name> as level_path."),
+        TEXT("Create a new UE level from a template (Open World by default) and open it. Tip: use /Game/Maps/<Name> as level_path."),
         SimpleSchema({
-            {"level_path", "Content-browser path for the new level (e.g. /Game/Maps/CityBlock01)"}
+            {"level_path",      "Content-browser path for the new level (e.g. /Game/Maps/CityBlock01)"},
+            {"template_path",   "Template level to clone (default Open World; pass \"\" for a truly blank level)"},
+            {"overwrite",       "If true, delete an existing level at level_path first (default false)"},
+            {"strip_landscape", "If true, delete the template's landscape after cloning — for GIS levels that import their own terrain (default false)"}
         }, {"level_path"})));
 
     Add(MakeTool(TEXT("gis_open_level"),
