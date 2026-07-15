@@ -63,7 +63,7 @@ public class UnrealMCP : ModuleRules
 				"LevelEditor",
 				// Tempo zone graph pipeline
 				"TempoAgentsEditor",
-				"TempoAgentsShared",
+				"TempoAgents",
 				"ZoneGraph",
 			}
 		);

@@ -28,12 +28,29 @@ private:
     TSharedPtr<FJsonObject> HandleViewerListLayers(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleViewerClear(const TSharedPtr<FJsonObject>& Params);
 
-    // Camera
+    // Camera. Wire command: gis_focus_landscapes (TODO(rename): viewport_focus_landscapes — not geospatial).
     TSharedPtr<FJsonObject> HandleFocusLandscapes(const TSharedPtr<FJsonObject>& Params);
 
-    // Report markers
+    // Report markers. Wire command: gis_screenshot_markers (TODO(rename): viewport_screenshot_markers).
     TSharedPtr<FJsonObject> HandleScreenshotMarkers(const TSharedPtr<FJsonObject>& Params);
 
-    // Tempo zone graph pipeline
+    // Zone graph visualization screenshots. Wire command: viewport_screenshot_zone_graph
+    // (also handled directly on UUnrealMCPBridge).
+    TSharedPtr<FJsonObject> HandleScreenshotZoneGraph(const TSharedPtr<FJsonObject>& Params);
+
+    // Tempo zone graph pipeline. Wire command: gis_build_zone_graph
+    // (TODO(rename): roadnet_build_zone_graph — operates on road-network actors, not GIS).
     TSharedPtr<FJsonObject> HandleBuildZoneGraph(const TSharedPtr<FJsonObject>& Params);
+
+    // Road-network diagnostics (roadnet_* wire commands — no GIS dependency).
+    // roadnet_summarize_semantic
+    TSharedPtr<FJsonObject> HandleSummarizeRoadNetworkSemantic(const TSharedPtr<FJsonObject>& Params);
+    // roadnet_summarize_lane_graph
+    TSharedPtr<FJsonObject> HandleSummarizeLaneGraph(const TSharedPtr<FJsonObject>& Params);
+    // roadnet_validate
+    TSharedPtr<FJsonObject> HandleValidateRoadNetwork(const TSharedPtr<FJsonObject>& Params);
+    // roadnet_reconcile
+    TSharedPtr<FJsonObject> HandleReconcileRoadNetwork(const TSharedPtr<FJsonObject>& Params);
+    // roadnet_list_markers
+    TSharedPtr<FJsonObject> HandleListReportMarkers(const TSharedPtr<FJsonObject>& Params);
 };

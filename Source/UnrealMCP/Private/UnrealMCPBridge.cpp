@@ -62,6 +62,9 @@
 #include "Misc/CommandLine.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
+#include "LevelEditor.h"
+#include "ILevelEditor.h"
+#include "SLevelViewport.h"
 
 // ServeGISTools — for async landscape + vector roads import
 #include "ProcessObjects/ServeProcessRasterToLandscape.h"
@@ -720,34 +723,50 @@ void UUnrealMCPBridge::OnGISVectorRoadsSucceeded()
         do { P = FServeGISRoadImportUtils::RunCarriagwayMergePass(SpawnedRoads, StyleTable, MergeDistCm); } while (P > 0);
     }
 
-    // Build road mesh geometry. Without this call roads have control points but no mesh.
+    // Count spawned roads for the response.
     int32 Spawned = 0;
     for (const FServeGISRoadEntry& Info : SpawnedRoads) { if (IsValid(Info.Road)) { ++Spawned; } }
 
-    Network->RebuildRoadNetworkIncremental({}, {}, false);
-
+    // The GDAL shapes/params are done with once roads are spawned; release the proc now.
     PendingVectorRoadsProc->RemoveFromRoot();
     PendingVectorRoadsProc = nullptr;
     PendingVectorRoadsParams.Reset();
 
-    TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
-    R->SetBoolField(TEXT("success"), true);
-    R->SetNumberField(TEXT("roads_spawned"), Spawned);
-    R->SetNumberField(TEXT("roads_skipped"), Skipped);
+    // Build road mesh geometry. Without this call roads have control points but no mesh.
+    //
+    // RebuildRoadNetworkIncremental kicks off an ASYNC, progressive commit: with a realtime editor
+    // viewport RoadBLD spreads the mesh commit (actor spawn + UStaticMesh::Build) across future ticks
+    // via an FTSTicker (RebuildCommitter::Apply, budget > 0) rather than finishing inline. If we
+    // fulfilled the promise here — before that commit completes — the caller (e.g. the create-level
+    // SOP) would proceed to save_current_level() while the ticker is still building StaticMeshes, and
+    // the save serialization races the async mesh build → SIGSEGV in
+    // UStaticMesh::WaitUntilAsyncPropertyReleased. So defer the "success" response until the rebuild's
+    // OnComplete fires — it runs only after the final commit phase in both the synchronous and
+    // async-full-rebuild paths — guaranteeing the network is fully built (and safe to save) before the
+    // caller does anything else.
+    Network->RebuildRoadNetworkIncremental(
+        /*ModifiedRoads=*/{}, /*RoadsToIgnore=*/{}, /*bFastPreview=*/false, /*bForceRebuildAffectedRoads=*/false,
+        /*OnComplete=*/[this, Spawned, Skipped]()
+        {
+            TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+            R->SetBoolField(TEXT("success"), true);
+            R->SetNumberField(TEXT("roads_spawned"), Spawned);
+            R->SetNumberField(TEXT("roads_skipped"), Skipped);
 
-    TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
-    Resp->SetStringField(TEXT("status"), TEXT("success"));
-    Resp->SetObjectField(TEXT("result"), R);
+            TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+            Resp->SetStringField(TEXT("status"), TEXT("success"));
+            Resp->SetObjectField(TEXT("result"), R);
 
-    FString Out;
-    TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
-    FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
+            FString Out;
+            TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+            FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
 
-    if (PendingVectorRoadsPromise.IsValid())
-    {
-        PendingVectorRoadsPromise->SetValue(Out);
-        PendingVectorRoadsPromise.Reset();
-    }
+            if (PendingVectorRoadsPromise.IsValid())
+            {
+                PendingVectorRoadsPromise->SetValue(Out);
+                PendingVectorRoadsPromise.Reset();
+            }
+        });
 }
 
 void UUnrealMCPBridge::OnGISVectorRoadsFailed(const FString& ErrorMessage, int32 ErrorCode)
@@ -1000,6 +1019,193 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
         return MakeJsonStr(Resp);
     }
 
+    // viewport_set_zone_graph_overlay: enable or disable the Navigation show flag in the active viewport.
+    // Pure editor-viewport UI (a show flag), no GIS dependency — hence the viewport_ prefix.
+    // {"type":"viewport_set_zone_graph_overlay","params":{"enabled":true}}
+    if (CommandType == TEXT("viewport_set_zone_graph_overlay"))
+    {
+        bool bEnable = true;
+        Params->TryGetBoolField(TEXT("enabled"), bEnable);
+        TPromise<bool> P; TFuture<bool> F = P.GetFuture();
+        AsyncTask(ENamedThreads::GameThread, [bEnable, P2 = MoveTemp(P)]() mutable {
+            auto& LEM = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+            auto LE = LEM.GetFirstLevelEditor();
+            if (LE) {
+                auto VP = LE->GetActiveViewportInterface();
+                if (VP) {
+                    FLevelEditorViewportClient& VC = VP->GetLevelViewportClient();
+                    VC.EngineShowFlags.SetNavigation(bEnable);
+                    VC.Invalidate();
+                }
+            }
+            P2.SetValue(true);
+        });
+        F.Get();
+        auto R = MakeShared<FJsonObject>();
+        R->SetBoolField(TEXT("success"), true);
+        R->SetBoolField(TEXT("enabled"), bEnable);
+        TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+        Resp->SetStringField(TEXT("status"), TEXT("success"));
+        Resp->SetObjectField(TEXT("result"), R);
+        FString Out; TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+        FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
+        return Out;
+    }
+
+    // viewport_screenshot_zone_graph: enable Navigation show flag (drives ZoneGraph lane rendering),
+    // take perspective + top-down screenshots, then leave the flag ON so zone graph stays visible.
+    // Editor-viewport capture, no GIS dependency — hence the viewport_ prefix.
+    // Handled here (server thread) so the game thread is free to render while we poll for files.
+    if (CommandType == TEXT("viewport_screenshot_zone_graph"))
+    {
+        auto MakeJsonStrZG = [](TSharedPtr<FJsonObject> Obj) -> FString {
+            FString S; TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&S);
+            FJsonSerializer::Serialize(Obj.ToSharedRef(), W); return S;
+        };
+        auto ErrZG = [&MakeJsonStrZG](const FString& Msg) -> FString {
+            TSharedPtr<FJsonObject> E = MakeShared<FJsonObject>();
+            E->SetStringField(TEXT("status"), TEXT("error"));
+            E->SetStringField(TEXT("error"), Msg);
+            return MakeJsonStrZG(E);
+        };
+
+        // Step 1 — gather scene bounds, FOV, and enable Navigation show flag (game thread).
+        struct FZGContext { FBox Box; float HalfHTan=0; float HalfVTan=0; bool bWasNav=false; FString Err; };
+        TPromise<FZGContext> CtxPromise;
+        TFuture<FZGContext> CtxFuture = CtxPromise.GetFuture();
+        AsyncTask(ENamedThreads::GameThread, [P = MoveTemp(CtxPromise)]() mutable {
+            FZGContext C;
+            UWorld* W = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+            if (!W) { C.Err = TEXT("viewport_screenshot_zone_graph: no editor world"); P.SetValue(C); return; }
+            C.Box = FBox(ForceInit);
+            for (TActorIterator<ALandscape> It(W); It; ++It) {
+                FVector O, E; It->GetActorBounds(false, O, E);
+                C.Box += FBox(O-E, O+E);
+            }
+            if (!C.Box.IsValid) { C.Err = TEXT("viewport_screenshot_zone_graph: no Landscape actors"); P.SetValue(C); return; }
+            auto& LEM = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+            auto LE = LEM.GetFirstLevelEditor();
+            if (!LE) { C.Err = TEXT("viewport_screenshot_zone_graph: LevelEditor unavailable"); P.SetValue(C); return; }
+            auto VP = LE->GetActiveViewportInterface();
+            if (!VP) { C.Err = TEXT("viewport_screenshot_zone_graph: no active viewport"); P.SetValue(C); return; }
+            FLevelEditorViewportClient* VC = &VP->GetLevelViewportClient();
+            C.bWasNav = VC->EngineShowFlags.Navigation != 0;
+            VC->EngineShowFlags.SetNavigation(true);
+            const FIntPoint Sz = VC->Viewport ? VC->Viewport->GetSizeXY() : FIntPoint(1920,1080);
+            const float Asp = Sz.Y > 0 ? (float)Sz.X/Sz.Y : 16.f/9.f;
+            const float HFov = FMath::DegreesToRadians(FMath::Max(VC->ViewFOV, 10.f));
+            C.HalfHTan = FMath::Tan(HFov * 0.5f);
+            C.HalfVTan = FMath::Tan(2.f * FMath::Atan(C.HalfHTan / Asp) * 0.5f);
+            VC->Invalidate();
+            P.SetValue(C);
+        });
+        FZGContext Ctx = CtxFuture.Get();
+        if (!Ctx.Err.IsEmpty()) return ErrZG(Ctx.Err);
+
+        // Optional close-up: override landscape framing with a custom box.
+        // Pass {"location":{"x":...,"y":...,"z":...},"extent":2000} to zoom into a specific area.
+        {
+            const TSharedPtr<FJsonObject>* LocObj;
+            if (Params->TryGetObjectField(TEXT("location"), LocObj) && LocObj)
+            {
+                double X = 0, Y = 0, Z = 0, Ext = 2000;
+                (*LocObj)->TryGetNumberField(TEXT("x"), X);
+                (*LocObj)->TryGetNumberField(TEXT("y"), Y);
+                (*LocObj)->TryGetNumberField(TEXT("z"), Z);
+                Params->TryGetNumberField(TEXT("extent"), Ext);
+                Ctx.Box = FBox(FVector(X - Ext, Y - Ext, Z - Ext * 0.5),
+                               FVector(X + Ext, Y + Ext, Z + Ext * 0.5));
+            }
+        }
+
+        // Step 2 — per-shot helper: position camera + fire HighResShot on game thread, poll here.
+        const FString ShotDir = FPaths::ConvertRelativePathToFull(FPaths::ScreenShotDir());
+        IFileManager& FM2 = IFileManager::Get();
+
+        // If "use_current_camera" is true, skip auto-framing and shoot from the current viewport position.
+        bool bUseCurrentCamera = false;
+        Params->TryGetBoolField(TEXT("use_current_camera"), bUseCurrentCamera);
+
+        auto TakeZGShot = [&](const FString& DestPath, float Pitch, float Yaw) -> bool {
+            TSet<FString> Before;
+            FM2.IterateDirectory(*ShotDir, [&Before](const TCHAR* P, bool bDir) -> bool {
+                if (!bDir) { FString N = FPaths::GetCleanFilename(P);
+                    if (N.StartsWith(TEXT("Highres")) && N.EndsWith(TEXT(".png"))) Before.Add(N); }
+                return true;
+            });
+            const FBox SBox = Ctx.Box;
+            const float HHT = Ctx.HalfHTan, HVT = Ctx.HalfVTan;
+            AsyncTask(ENamedThreads::GameThread, [SBox, HHT, HVT, Pitch, Yaw, bUseCurrentCamera]() {
+                auto& LEM2 = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+                auto LE2 = LEM2.GetFirstLevelEditor(); if (!LE2) return;
+                auto VP2 = LE2->GetActiveViewportInterface(); if (!VP2) return;
+                FLevelEditorViewportClient* VC2 = &VP2->GetLevelViewportClient();
+                if (!bUseCurrentCamera)
+                {
+                    const float PR = FMath::DegreesToRadians(Pitch), YR = FMath::DegreesToRadians(Yaw);
+                    const FVector Fwd(FMath::Cos(PR)*FMath::Cos(YR), FMath::Cos(PR)*FMath::Sin(YR), FMath::Sin(PR));
+                    const FVector Rt = FVector::CrossProduct(FVector::UpVector, Fwd).GetSafeNormal();
+                    const FVector Up = FVector::CrossProduct(Fwd, Rt).GetSafeNormal();
+                    const FVector Ctr = SBox.GetCenter(), Ext = SBox.GetExtent();
+                    float DMin = 1.f;
+                    for (int32 i = 0; i < 8; ++i) {
+                        const FVector C2 = Ctr + FVector((i&1)?Ext.X:-Ext.X,(i&2)?Ext.Y:-Ext.Y,(i&4)?Ext.Z:-Ext.Z);
+                        const FVector D2 = C2 - Ctr;
+                        DMin = FMath::Max(DMin, FMath::Abs(FVector::DotProduct(D2,Rt))/HHT - FVector::DotProduct(D2,Fwd));
+                        DMin = FMath::Max(DMin, FMath::Abs(FVector::DotProduct(D2,Up))/HVT - FVector::DotProduct(D2,Fwd));
+                    }
+                    VC2->SetViewLocation(Ctr - Fwd*(DMin*1.05f));
+                    VC2->SetViewRotation(FRotator(Pitch, Yaw, 0.f));
+                    VC2->Invalidate();
+                }
+                UWorld* W2 = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+                GEngine->Exec(W2, TEXT("HighResShot 1"));
+            });
+            FString NewFile;
+            const double Deadline = FPlatformTime::Seconds() + 20.0;
+            while (FPlatformTime::Seconds() < Deadline) {
+                FPlatformProcess::Sleep(0.15f);
+                FM2.IterateDirectory(*ShotDir, [&](const TCHAR* P, bool bDir) -> bool {
+                    if (!bDir) { FString N = FPaths::GetCleanFilename(P);
+                        if (N.StartsWith(TEXT("Highres")) && N.EndsWith(TEXT(".png")) && !Before.Contains(N))
+                            NewFile = P; }
+                    return true;
+                });
+                if (!NewFile.IsEmpty()) break;
+            }
+            if (NewFile.IsEmpty()) return false;
+            FM2.Copy(*DestPath, *NewFile);
+            return true;
+        };
+
+        const FString PerspPath = ShotDir / TEXT("zonegraph_persp.png");
+        const FString TopPath   = ShotDir / TEXT("zonegraph_top.png");
+        const bool bPerspOk = TakeZGShot(PerspPath, -45.f,  45.f);
+        const bool bTopOk   = TakeZGShot(TopPath,   -89.9f,  0.f);
+
+        // Step 3 — leave Navigation show flag ON so zone graph stays visible in the editor.
+        // (Previously it was restored to the pre-shot state, which turned it off and hid the overlay.)
+        AsyncTask(ENamedThreads::GameThread, []() {
+            auto& LEM3 = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+            auto LE3 = LEM3.GetFirstLevelEditor(); if (!LE3) return;
+            auto VP3 = LE3->GetActiveViewportInterface(); if (!VP3) return;
+            FLevelEditorViewportClient* VC3 = &VP3->GetLevelViewportClient();
+            VC3->EngineShowFlags.SetNavigation(true);
+            VC3->Invalidate();
+        });
+
+        if (!bPerspOk && !bTopOk)
+            return ErrZG(TEXT("viewport_screenshot_zone_graph: HighResShot did not produce files within timeout"));
+
+        TSharedPtr<FJsonObject> ZGResult = MakeShared<FJsonObject>();
+        ZGResult->SetStringField(TEXT("perspective"), bPerspOk ? PerspPath : TEXT("(failed)"));
+        ZGResult->SetStringField(TEXT("topdown"),     bTopOk   ? TopPath   : TEXT("(failed)"));
+        TSharedPtr<FJsonObject> ZGResp = MakeShared<FJsonObject>();
+        ZGResp->SetStringField(TEXT("status"), TEXT("success"));
+        ZGResp->SetObjectField(TEXT("result"), ZGResult);
+        return MakeJsonStrZG(ZGResp);
+    }
+
     // Create a promise to wait for the result
     TPromise<FString> Promise;
     TFuture<FString> Future = Promise.GetFuture();
@@ -1075,7 +1281,10 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                 ResultJson = UMGCommands->HandleCommand(CommandType, Params);
             }
             // GIS Commands (synchronous; gis_import_landscape and gis_import_vector_roads handled above)
+            // roadnet_* diagnostics and viewport_* visualization route through the same
+            // FUnrealMCPGISCommands handler.
             else if (CommandType == TEXT("gis_create_level") ||
+                     // TODO(rename): gis_open_level -> level_open (not geospatial)
                      CommandType == TEXT("gis_open_level") ||
                      CommandType == TEXT("gis_get_geo_anchor") ||
                      CommandType == TEXT("gis_set_geo_anchor") ||
@@ -1085,9 +1294,18 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_viewer_load_file") ||
                      CommandType == TEXT("gis_viewer_list_layers") ||
                      CommandType == TEXT("gis_viewer_clear") ||
+                     // TODO(rename): gis_focus_landscapes -> viewport_focus_landscapes
                      CommandType == TEXT("gis_focus_landscapes") ||
+                     // TODO(rename): gis_screenshot_markers -> viewport_screenshot_markers
                      CommandType == TEXT("gis_screenshot_markers") ||
-                     CommandType == TEXT("gis_build_zone_graph"))
+                     // TODO(rename): gis_build_zone_graph -> roadnet_build_zone_graph
+                     CommandType == TEXT("gis_build_zone_graph") ||
+                     // Road-network diagnostics (no GIS dependency)
+                     CommandType == TEXT("roadnet_summarize_semantic") ||
+                     CommandType == TEXT("roadnet_summarize_lane_graph") ||
+                     CommandType == TEXT("roadnet_validate") ||
+                     CommandType == TEXT("roadnet_reconcile") ||
+                     CommandType == TEXT("roadnet_list_markers"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);
             }
