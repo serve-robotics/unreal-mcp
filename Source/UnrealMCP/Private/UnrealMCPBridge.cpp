@@ -751,34 +751,18 @@ void UUnrealMCPBridge::OnGISVectorRoadsSucceeded()
     PendingVectorRoadsProc = nullptr;
     PendingVectorRoadsParams.Reset();
 
-    // Build road mesh geometry. Without this call roads have control points but no mesh.
-    //
-    // RebuildRoadNetworkIncremental kicks off an ASYNC, progressive commit: with a realtime editor
-    // viewport RoadBLD spreads the mesh commit (actor spawn + UStaticMesh::Build) across future ticks
-    // via an FTSTicker (RebuildCommitter::Apply, budget > 0) rather than finishing inline. If we
-    // fulfilled the promise here — before that commit completes — the caller (e.g. the create-level
-    // SOP) would proceed to save_current_level() while the ticker is still building StaticMeshes, and
-    // the save serialization races the async mesh build → SIGSEGV in
-    // UStaticMesh::WaitUntilAsyncPropertyReleased. So defer the "success" response until the rebuild's
-    // OnComplete fires — it runs only after the final commit phase in both the synchronous and
-    // async-full-rebuild paths — guaranteeing the network is fully built (and safe to save) before the
-    // caller does anything else.
-    Network->RebuildRoadNetworkIncremental(
-        /*ModifiedRoads=*/{}, /*RoadsToIgnore=*/{}, /*bFastPreview=*/false, /*bForceRebuildAffectedRoads=*/false,
-        /*OnComplete=*/[this, Spawned, Skipped]()
-        {
-            TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
-            R->SetBoolField(TEXT("success"), true);
-            R->SetNumberField(TEXT("roads_spawned"), Spawned);
-            R->SetNumberField(TEXT("roads_skipped"), Skipped);
+    TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), true);
+    R->SetNumberField(TEXT("roads_spawned"), Spawned);
+    R->SetNumberField(TEXT("roads_skipped"), Skipped);
 
-            TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
-            Resp->SetStringField(TEXT("status"), TEXT("success"));
-            Resp->SetObjectField(TEXT("result"), R);
+    TSharedPtr<FJsonObject> Resp = MakeShared<FJsonObject>();
+    Resp->SetStringField(TEXT("status"), TEXT("success"));
+    Resp->SetObjectField(TEXT("result"), R);
 
-            FString Out;
-            TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
-            FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
+    FString Out;
+    TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Out);
+    FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
 
     // Rebuild is intentionally NOT triggered here.
     // gis_rebuild_road_networks uses RebuildRoadNetworkIncremental's OnComplete
