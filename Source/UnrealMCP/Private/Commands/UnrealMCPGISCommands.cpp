@@ -106,6 +106,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_assign_district"))      return HandleAssignDistrict(Params);
     if (CommandType == TEXT("gis_generate_buildings"))   return HandleGenerateBuildings(Params);
     if (CommandType == TEXT("gis_generate_procedural_roads")) return HandleGenerateProceduralRoads(Params);
+    if (CommandType == TEXT("gis_toggle_block_previews"))     return HandleToggleBlockPreviews(Params);
 
     // Sidewalk theming
     if (CommandType == TEXT("gis_list_sidewalk_presets")) return HandleListSidewalkPresets(Params);
@@ -1674,6 +1675,33 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateBlockShapes(const T
     auto R = MakeShared<FJsonObject>();
     R->SetBoolField  (TEXT("success"), true);
     R->SetStringField(TEXT("message"), TEXT("Block shapes generated"));
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_toggle_block_previews
+// Params: visible (bool, required) — true = show, false = hide block preview meshes
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleToggleBlockPreviews(const TSharedPtr<FJsonObject>& Params)
+{
+    bool bVisible = false;
+    if (!Params->TryGetBoolField(TEXT("visible"), bVisible))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_toggle_block_previews: 'visible' (bool) param required."));
+
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_toggle_block_previews: no editor world available"));
+
+    FCityGenerationUtils::ToggleBlockPreviews(World, bVisible);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"), true);
+    R->SetBoolField  (TEXT("visible"), bVisible);
+    R->SetStringField(TEXT("message"), bVisible
+        ? TEXT("Block preview meshes shown")
+        : TEXT("Block preview meshes hidden"));
     return R;
 }
 
