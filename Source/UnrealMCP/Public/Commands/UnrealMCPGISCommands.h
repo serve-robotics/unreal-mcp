@@ -31,6 +31,14 @@ private:
     // Camera. Wire command: gis_focus_landscapes (TODO(rename): viewport_focus_landscapes — not geospatial).
     TSharedPtr<FJsonObject> HandleFocusLandscapes(const TSharedPtr<FJsonObject>& Params);
 
+    // Camera. Wire command: gis_camera_top_down. Mirrors the GIS panel's "Top-Down" button
+    // (SServeGISOperationsPanel.cpp) exactly — same landscape-bounds + FOV height calc, same
+    // straight-down FRotator(-90,0,0). NOT a parameterization of HandleFocusLandscapes: that
+    // function's Right/Up basis is undefined at pitch=-90 (Forward becomes parallel to
+    // FVector::UpVector, so CrossProduct(Up, Forward) is zero) — a genuinely separate code path
+    // is required for true top-down, not just passing pitch=-90 to it.
+    TSharedPtr<FJsonObject> HandleCameraTopDown(const TSharedPtr<FJsonObject>& Params);
+
     // Report markers. Wire command: gis_screenshot_markers (TODO(rename): viewport_screenshot_markers).
     TSharedPtr<FJsonObject> HandleScreenshotMarkers(const TSharedPtr<FJsonObject>& Params);
 

@@ -1582,6 +1582,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_viewer_clear") ||
                      // TODO(rename): gis_focus_landscapes -> viewport_focus_landscapes
                      CommandType == TEXT("gis_focus_landscapes") ||
+                     CommandType == TEXT("gis_camera_top_down") ||
                      // TODO(rename): gis_screenshot_markers -> viewport_screenshot_markers
                      CommandType == TEXT("gis_screenshot_markers") ||
                      // TODO(rename): gis_build_zone_graph -> roadnet_build_zone_graph

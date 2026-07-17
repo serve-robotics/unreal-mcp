@@ -19,6 +19,7 @@
 #include "LevelEditor.h"
 #include "ILevelEditor.h"
 #include "SLevelViewport.h"
+#include "EditorViewportClient.h"
 
 // ServeGISTools — runtime
 #include "Anchor/ServeGeoAnchor.h"
@@ -85,6 +86,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
 
     // TODO(rename): viewport framing, not geospatial. Rename to viewport_focus_landscapes (has existing callers).
     if (CommandType == TEXT("gis_focus_landscapes"))      return HandleFocusLandscapes(Params);
+    if (CommandType == TEXT("gis_camera_top_down"))       return HandleCameraTopDown(Params);
     // TODO(rename): viewport capture, not geospatial. Rename to viewport_screenshot_markers (has existing callers).
     if (CommandType == TEXT("gis_screenshot_markers"))    return HandleScreenshotMarkers(Params);
     // TODO(rename): operates on road-network actors, not GIS. Rename to roadnet_build_zone_graph (has existing callers).
@@ -735,6 +737,69 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleFocusLandscapes(const TShar
             FMath::RadiansToDegrees(HFovRad),
             FMath::RadiansToDegrees(VFovRad),
             AspectRatio));
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_camera_top_down
+// Mirrors the GIS panel's "Top-Down" button (SServeGISOperationsPanel.cpp) exactly: same
+// landscape-bounds-from-ALandscapeProxy + FOV-height calc, same FRotator(-90,0,0). Kept as a
+// separate code path from HandleFocusLandscapes rather than a pitch=-90 parameterization of it —
+// that function's Right/Up camera basis is undefined at pitch=-90 (Forward becomes parallel to
+// FVector::UpVector, so CrossProduct(Up, Forward) degenerates to zero).
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCameraTopDown(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_camera_top_down: no editor world"));
+
+    if (!GEditor)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_camera_top_down: GEditor unavailable"));
+
+    FViewport* VP = GEditor->GetActiveViewport();
+    if (!VP)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_camera_top_down: no active viewport"));
+    FEditorViewportClient* Client = static_cast<FEditorViewportClient*>(VP->GetClient());
+    if (!Client)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_camera_top_down: no viewport client"));
+
+    // Combined bounding box of all landscape actors (proxies too, for WP levels).
+    FBox Bounds(ForceInit);
+    int32 LandscapeCount = 0;
+    for (TActorIterator<ALandscapeProxy> It(World); It; ++It)
+    {
+        if (IsValid(*It))
+        {
+            Bounds += (*It)->GetComponentsBoundingBox(true);
+            ++LandscapeCount;
+        }
+    }
+
+    if (LandscapeCount == 0)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_camera_top_down: no Landscape actors in level"));
+
+    FVector CamLocation = Bounds.IsValid ? Bounds.GetCenter() : FVector::ZeroVector;
+    if (Bounds.IsValid)
+    {
+        const FVector Extent  = Bounds.GetExtent();
+        const float HalfSpan  = FMath::Max(Extent.X, Extent.Y);
+        const float FOVRad    = FMath::DegreesToRadians(FMath::Max(Client->ViewFOV, 10.f));
+        const float Height    = HalfSpan / FMath::Tan(FOVRad * 0.5f);
+        CamLocation.Z += Height;
+    }
+
+    Client->SetViewLocation(CamLocation);
+    Client->SetViewRotation(FRotator(-90.f, 0.f, 0.f));
+    Client->Invalidate();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), true);
+    R->SetNumberField(TEXT("landscape_count"), LandscapeCount);
+    R->SetStringField(TEXT("camera_location"),
+        FString::Printf(TEXT("(%.0f, %.0f, %.0f)"), CamLocation.X, CamLocation.Y, CamLocation.Z));
+    R->SetStringField(TEXT("camera_rotation"), TEXT("pitch=-90.0 yaw=0.0"));
     return R;
 }
 
