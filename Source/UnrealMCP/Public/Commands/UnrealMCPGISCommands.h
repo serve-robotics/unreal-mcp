@@ -78,4 +78,7 @@ private:
 
     // Landscape conformation
     TSharedPtr<FJsonObject> HandleConformLandscapeToRoads(const TSharedPtr<FJsonObject>& Params);
+
+    // World Partition streaming toggle. Wire command: gis_set_world_partition_streaming
+    TSharedPtr<FJsonObject> HandleSetWorldPartitionStreaming(const TSharedPtr<FJsonObject>& Params);
 };

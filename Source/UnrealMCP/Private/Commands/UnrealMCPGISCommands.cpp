@@ -20,6 +20,8 @@
 #include "ILevelEditor.h"
 #include "SLevelViewport.h"
 #include "EditorViewportClient.h"
+#include "GameFramework/WorldSettings.h"
+#include "WorldPartition/WorldPartition.h"
 
 // ServeGISTools — runtime
 #include "Anchor/ServeGeoAnchor.h"
@@ -116,6 +118,9 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
 
     // Landscape conformation
     if (CommandType == TEXT("gis_conform_landscape_to_roads")) return HandleConformLandscapeToRoads(Params);
+
+    // World Partition streaming toggle
+    if (CommandType == TEXT("gis_set_world_partition_streaming")) return HandleSetWorldPartitionStreaming(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -2149,6 +2154,49 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
     R->SetNumberField(TEXT("roads_no_spline"),   NoSpline);
     R->SetNumberField(TEXT("falloff_multiplier"), FalloffMultiplier);
     R->SetNumberField(TEXT("height_offset_cm"),  HeightOffsetCm);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_set_world_partition_streaming
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetWorldPartitionStreaming(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_set_world_partition_streaming: no editor world"));
+    }
+
+    bool bEnableStreaming = false;
+    if (Params.IsValid())
+    {
+        Params->TryGetBoolField(TEXT("enable_streaming"), bEnableStreaming);
+    }
+
+    AWorldSettings* WorldSettings = World->GetWorldSettings();
+    UWorldPartition* WorldPartition = WorldSettings ? WorldSettings->GetWorldPartition() : nullptr;
+    if (!WorldPartition)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_set_world_partition_streaming: level has no World Partition"));
+    }
+
+    const bool bWasEnabled = WorldPartition->IsStreamingEnabledInEditor();
+    WorldPartition->SetEnableStreaming(bEnableStreaming);
+
+    ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
+    if (LES)
+    {
+        LES->SaveCurrentLevel();
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), true);
+    R->SetBoolField(TEXT("was_enabled"), bWasEnabled);
+    R->SetBoolField(TEXT("enable_streaming"), bEnableStreaming);
     return R;
 }
 
