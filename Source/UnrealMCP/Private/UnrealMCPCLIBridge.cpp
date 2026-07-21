@@ -630,6 +630,15 @@ TArray<TSharedPtr<FJsonValue>> FUnrealMCPCLIBridge::BuildToolList()
              "Returns road_actor_count and a success message, or an error with diagnostic info."),
         SimpleSchema({}, {})));
 
+    Add(MakeTool(TEXT("gis_set_world_partition_streaming"),
+        TEXT("Enable or disable World Partition streaming for the current level's WorldSettings. "
+             "Disabling makes every actor always-loaded (bIsSpatiallyLoaded forced false), which is "
+             "correct for small, fully-generated levels (e.g. grid towns) where streaming has no "
+             "benefit and instead produces 'World references spatially loaded actor' MapCheck errors."),
+        SimpleSchema({
+            {"enable_streaming", "true to enable WP streaming, false to disable (default false)"}
+        }, {})));
+
     return Tools;
 }
 
