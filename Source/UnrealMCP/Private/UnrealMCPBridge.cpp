@@ -1587,16 +1587,17 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_screenshot_markers") ||
                      // TODO(rename): gis_build_zone_graph -> roadnet_build_zone_graph
                      CommandType == TEXT("gis_build_zone_graph") ||
-                     CommandType == TEXT("gis_summarize_road_network_semantic") ||
-                     CommandType == TEXT("gis_summarize_lane_graph") ||
-                     CommandType == TEXT("gis_validate_road_network") ||
-                     CommandType == TEXT("gis_reconcile_road_network") ||
-                     CommandType == TEXT("gis_list_report_markers") ||
+                     CommandType == TEXT("roadnet_summarize_semantic") ||
+                     CommandType == TEXT("roadnet_summarize_lane_graph") ||
+                     CommandType == TEXT("roadnet_validate") ||
+                     CommandType == TEXT("roadnet_reconcile") ||
+                     CommandType == TEXT("roadnet_list_markers") ||
                      CommandType == TEXT("gis_list_districts") ||
                      CommandType == TEXT("gis_generate_block_shapes") ||
                      CommandType == TEXT("gis_assign_district") ||
                      CommandType == TEXT("gis_generate_buildings") ||
                      CommandType == TEXT("gis_generate_procedural_roads") ||
+                     CommandType == TEXT("gis_toggle_block_previews") ||
                      CommandType == TEXT("gis_list_sidewalk_presets") ||
                      CommandType == TEXT("gis_set_road_sidewalk") ||
                      CommandType == TEXT("gis_conform_landscape_to_roads") ||
