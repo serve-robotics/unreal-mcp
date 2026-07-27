@@ -36,10 +36,6 @@
 			"Enabled": true
 		},
 		{
-			"Name": "ServeGISTools",
-			"Enabled": true
-		},
-		{
 			"Name": "RoadBLD",
 			"Enabled": true
 		}
