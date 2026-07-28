@@ -66,7 +66,7 @@
 #include "ILevelEditor.h"
 #include "SLevelViewport.h"
 
-// ServeGISTools — for async landscape + vector roads import
+// ServeLevelGenTools — for async landscape + vector roads import
 #include "ProcessObjects/ServeProcessRasterToLandscape.h"
 #include "ProcessObjects/ServeProcessVectorShapes.h"
 #include "Libraries/ServeGDALFunctionLibrary.h"
@@ -526,7 +526,7 @@ void UUnrealMCPBridge::OnGISVectorRoadsSucceeded()
         if (!StyleTable)
         {
             StyleTable = LoadObject<UServeGISRoadStyleTable>(nullptr,
-                TEXT("/ServeGISTools/Roads/RoadStyleSet_Default.RoadStyleSet_Default"));
+                TEXT("/Game/LevelGenTools/Roads/RoadStyleSet_Default.RoadStyleSet_Default"));
         }
         if (!StyleTable)
         {
