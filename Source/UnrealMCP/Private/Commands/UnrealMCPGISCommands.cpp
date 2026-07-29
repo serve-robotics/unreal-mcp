@@ -23,11 +23,11 @@
 #include "GameFramework/WorldSettings.h"
 #include "WorldPartition/WorldPartition.h"
 
-// ServeGISTools — runtime
+// ServeLevelGenTools — runtime
 #include "Anchor/ServeGeoAnchor.h"
 #include "ReportMarker/ServeGISReportMarker.h"
 
-// ServeGISTools — editor
+// ServeLevelGenTools — editor
 #include "OpenDRIVE/ServeOpenDRIVEImporter.h"
 #include "GISViewer/ServeGISViewerSubsystem.h"
 #include "GISViewer/GISViewerDataset.h"
@@ -520,7 +520,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleListRoadPresets(const TShar
     IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
 
     FARFilter Filter;
-    Filter.PackagePaths.Add(FName("/ServeGISTools/Roads/Presets"));
+    Filter.PackagePaths.Add(FName("/Game/LevelGenTools/Roads/Presets"));
     Filter.bRecursivePaths = true;
     Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
 

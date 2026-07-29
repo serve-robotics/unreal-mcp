@@ -54,8 +54,8 @@ public class UnrealMCP : ModuleRules
 				"AssetRegistry",
 				"PythonScriptPlugin",
 				// GIS integration
-				"ServeGISToolsRuntime",
-				"ServeGISToolsEditor",
+				"ServeLevelGenToolsRuntime",
+				"ServeLevelGenToolsEditor",
 				"GDAL",
 				"GDALThirdParty",
 				"Landscape",
@@ -65,7 +65,7 @@ public class UnrealMCP : ModuleRules
 				"TempoAgentsEditor",
 				"TempoAgents",
 				"ZoneGraph",
-				// City block / building generation (FCityGenerationUtils — now in ServeGISToolsEditor)
+				// City block / building generation (FCityGenerationUtils — now in ServeLevelGenToolsEditor)
 			}
 		);
 
