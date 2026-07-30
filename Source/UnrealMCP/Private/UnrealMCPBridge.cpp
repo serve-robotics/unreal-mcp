@@ -1664,7 +1664,11 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_list_sidewalk_presets") ||
                      CommandType == TEXT("gis_set_road_sidewalk") ||
                      CommandType == TEXT("gis_conform_landscape_to_roads") ||
-                     CommandType == TEXT("gis_set_world_partition_streaming"))
+                     CommandType == TEXT("gis_set_world_partition_streaming") ||
+                     CommandType == TEXT("gis_disable_external_actors") ||
+                     CommandType == TEXT("gis_clear_landscape_splines") ||
+                     CommandType == TEXT("gis_save_current_level") ||
+                     CommandType == TEXT("gis_set_validate_on_save_disabled"))
             {
                 ResultJson = GISCommands->HandleCommand(CommandType, Params);
             }

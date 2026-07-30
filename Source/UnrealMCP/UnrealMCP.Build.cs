@@ -80,6 +80,7 @@ public class UnrealMCP : ModuleRules
 					"UMGEditor",          // For WidgetBlueprint.h and other UMG editor functionality
 					"LandscapeEditor",    // GIS landscape creation
 					"WorldPartitionEditor", // gis_set_world_partition_streaming (UWorldPartition::SetEnableStreaming)
+					"DataValidation",     // FScopedDisableValidateOnSave — see HandleSetWorldPartitionStreaming
 				}
 			);
 		}
