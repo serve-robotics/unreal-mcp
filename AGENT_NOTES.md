@@ -133,7 +133,8 @@ The port is 55557; verify the editor is running first with `ss -tlnp | grep 5555
 needs sandbox disabled — alternatively check `Saved/Logs/VayuSim*.log` for "Server started").
 
 ### Populate a UDataAsset via MCP
-Use `execute_python` with the `unreal` module. Example: editing a `UServeGISRoadStyleTable`:
+Use `execute_python` with the `unreal` module. Example: editing a `UServeLevelGenerationTable`
+(formerly `UServeGISRoadStyleTable`):
 ```python
 import unreal
 table = unreal.EditorAssetLibrary.load_asset("/MyPlugin/Data/MyTable")
@@ -183,7 +184,7 @@ Execute it directly via MCP to get a world state snapshot, or exec() it to call 
 | `list_geo_anchors()` | All AServeGeoAnchor actors with EPSG, origin XY, Z |
 | `list_road_networks()` | All ADynamicRoadNetwork actors with road counts |
 | `delete_road_networks(pattern)` | Delete networks matching name pattern (None = all) |
-| `get_style_table_info(path)` | List entries in a UServeGISRoadStyleTable |
+| `get_style_table_info(path)` | List entries in a UServeLevelGenerationTable |
 | `inspect_preset(name)` | Lane layout + modules for a road preset CDO |
 | `list_gpkg_layers(path)` | List layers + feature counts in a GeoPackage file |
 | `get_gpkg_layer_schema(path, layer)` | Field names/types for a GeoPackage layer |

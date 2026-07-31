@@ -35,6 +35,7 @@
 
 // RoadBLD
 #include "DynamicRoad/DynamicRoadNetwork.h"
+#include "LevelGen/ServeLevelGenerationTable.h"
 #include "DynamicRoad/DynamicRoad.h"
 #include "DynamicRoad/DynamicRoadData.h"
 #include "DynamicRoad/DynamicRoadIntersection.h"
@@ -108,6 +109,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_list_districts"))       return HandleListDistricts(Params);
     if (CommandType == TEXT("gis_generate_block_shapes")) return HandleGenerateBlockShapes(Params);
     if (CommandType == TEXT("gis_assign_district"))      return HandleAssignDistrict(Params);
+    if (CommandType == TEXT("gis_assign_random_districts")) return HandleAssignRandomDistricts(Params);
     if (CommandType == TEXT("gis_generate_buildings"))   return HandleGenerateBuildings(Params);
     if (CommandType == TEXT("gis_generate_procedural_roads")) return HandleGenerateProceduralRoads(Params);
     if (CommandType == TEXT("gis_toggle_block_previews"))     return HandleToggleBlockPreviews(Params);
@@ -1807,6 +1809,80 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleAssignDistrict(const TShare
     R->SetBoolField  (TEXT("success"),        true);
     R->SetStringField(TEXT("district"),       DistrictName);
     R->SetNumberField(TEXT("blocks_assigned"), Count);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_assign_random_districts
+// Params: districts (array of strings, optional — explicit override, display/class names as accepted by
+//         gis_assign_district); level_generation_table (string, optional, only used when districts is
+//         empty/absent — object path to a UServeLevelGenerationTable, "" => random pick among every
+//         registered instance); seed (int, optional, default 0).
+// Assigns a district to every ACityBlock independently at random (uniform), seeded for reproducibility.
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleAssignRandomDistricts(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_assign_random_districts: no editor world available"));
+
+    int32 Seed = 0;
+    Params->TryGetNumberField(TEXT("seed"), Seed);
+    FRandomStream Stream(Seed);
+
+    TArray<UClass*> Candidates;
+    TArray<FString> CandidateNames;
+    FString Error;
+
+    const TArray<TSharedPtr<FJsonValue>>* DistrictsArray = nullptr;
+    if (Params->TryGetArrayField(TEXT("districts"), DistrictsArray) && DistrictsArray && !DistrictsArray->IsEmpty())
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *DistrictsArray)
+        {
+            const FString Name = Value->AsString();
+            UClass* DistrictClass = FCityGenerationUtils::FindDistrictClass(Name, Error);
+            if (!DistrictClass)
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("gis_assign_random_districts: %s"), *Error));
+            Candidates.Add(DistrictClass);
+            CandidateNames.Add(Name);
+        }
+    }
+    else
+    {
+        FString LevelGenTablePath;
+        Params->TryGetStringField(TEXT("level_generation_table"), LevelGenTablePath);
+
+        const UServeLevelGenerationTable* LevelGenTable = UServeLevelGenerationTable::ResolveOrPickRandom(LevelGenTablePath, Stream);
+        if (!LevelGenTable)
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                TEXT("gis_assign_random_districts: no 'districts' override given and level_generation_table ")
+                TEXT("could not be resolved (see log) — pass an explicit 'districts' list, or point ")
+                TEXT("level_generation_table at a UServeLevelGenerationTable with a populated DistrictPresets list"));
+
+        Candidates = FCityGenerationUtils::ResolveDistrictCandidatesFromTable(LevelGenTable);
+        for (UClass* DistrictClass : Candidates)
+            CandidateNames.Add(DistrictClass->GetName());
+
+        if (Candidates.IsEmpty())
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                TEXT("gis_assign_random_districts: resolved level_generation_table's DistrictPresets is empty ")
+                TEXT("(or none of its entries loaded) — populate it, or pass an explicit 'districts' list"));
+    }
+
+    int32 Count = 0;
+    if (!FCityGenerationUtils::AssignRandomDistrictsToBlocks(World, Candidates, Seed, Count, Error))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_assign_random_districts: %s"), *Error));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), true);
+    R->SetNumberField(TEXT("blocks_assigned"), Count);
+    TArray<TSharedPtr<FJsonValue>> CandidatesJson;
+    for (const FString& Name : CandidateNames)
+        CandidatesJson.Add(MakeShared<FJsonValueString>(Name));
+    R->SetArrayField(TEXT("candidates"), CandidatesJson);
     return R;
 }
 
