@@ -81,7 +81,7 @@
 #include "DynamicRoad/DynamicRoad.h"
 #include "DynamicRoad/DynamicRoadNetwork.h"
 #include "RoadGeo.h"
-#include "Roads/ServeGISRoadStyleTable.h"
+#include "LevelGen/ServeLevelGenerationTable.h"
 #include "GISViewer/ServeGISRoadImportUtils.h"
 #include "Containers/Ticker.h"
 #include "Settings/EditorLoadingSavingSettings.h"
@@ -512,12 +512,12 @@ void UUnrealMCPBridge::OnGISVectorRoadsSucceeded()
 
     // Load road style table — maps highway= tag values to per-type RoadBLD presets.
     // Accept optional override; fall back to the project default table asset.
-    UServeGISRoadStyleTable* StyleTable = nullptr;
+    UServeLevelGenerationTable* StyleTable = nullptr;
     {
         FString TablePath;
         if (Params && Params->TryGetStringField(TEXT("style_table_path"), TablePath) && !TablePath.IsEmpty())
         {
-            StyleTable = Cast<UServeGISRoadStyleTable>(UEditorAssetLibrary::LoadAsset(TablePath));
+            StyleTable = Cast<UServeLevelGenerationTable>(UEditorAssetLibrary::LoadAsset(TablePath));
             if (!StyleTable)
             {
                 UE_LOG(LogTemp, Warning, TEXT("gis_import_vector_roads: style_table_path '%s' could not be loaded"), *TablePath);
@@ -525,12 +525,12 @@ void UUnrealMCPBridge::OnGISVectorRoadsSucceeded()
         }
         if (!StyleTable)
         {
-            StyleTable = LoadObject<UServeGISRoadStyleTable>(nullptr,
-                TEXT("/Game/LevelGenTools/Roads/RoadStyleSet_Default.RoadStyleSet_Default"));
+            StyleTable = LoadObject<UServeLevelGenerationTable>(nullptr,
+                TEXT("/Game/LevelGenTools/ServeLevelGenerationTable_Default.ServeLevelGenerationTable_Default"));
         }
         if (!StyleTable)
         {
-            UE_LOG(LogTemp, Warning, TEXT("gis_import_vector_roads: no UServeGISRoadStyleTable found — roads will use uninitialized presets"));
+            UE_LOG(LogTemp, Warning, TEXT("gis_import_vector_roads: no UServeLevelGenerationTable found — roads will use uninitialized presets"));
         }
     }
 
@@ -1097,7 +1097,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
             // Clear landscape splines and re-enable autosave on game thread, then
             // fulfill the promise — ensures saves are safe before callers proceed.
             Network->RebuildRoadNetworkIncremental({}, {}, false, false,
-                [this, SuccessOut]()
+                [this, SuccessOut](bool /*bSuccess*/)
                 {
                     // OnComplete may fire on a background thread; dispatch to game thread
                     // for UObject modifications and promise fulfillment.
@@ -1595,6 +1595,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_list_districts") ||
                      CommandType == TEXT("gis_generate_block_shapes") ||
                      CommandType == TEXT("gis_assign_district") ||
+                     CommandType == TEXT("gis_assign_random_districts") ||
                      CommandType == TEXT("gis_generate_buildings") ||
                      CommandType == TEXT("gis_generate_procedural_roads") ||
                      CommandType == TEXT("gis_toggle_block_previews") ||
