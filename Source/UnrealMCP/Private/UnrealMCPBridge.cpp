@@ -1157,8 +1157,12 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
             // Clear landscape splines and re-enable autosave on game thread, then
             // fulfill the promise — ensures saves are safe before callers proceed.
             Network->RebuildRoadNetworkIncremental({}, {}, false, false,
-                [this, SuccessOut](bool /*bSuccess*/)
+                [this, SuccessOut](bool bRebuildSucceeded)
                 {
+                    if (!bRebuildSucceeded)
+                    {
+                        UE_LOG(LogUnrealMCP, Warning, TEXT("gis_rebuild_road_networks: rebuild aborted"));
+                    }
                     // OnComplete may fire on a background thread; dispatch to game thread
                     // for UObject modifications and promise fulfillment.
                     AsyncTask(ENamedThreads::GameThread, [this, SuccessOut]()
