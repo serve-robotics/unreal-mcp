@@ -111,6 +111,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_assign_district"))      return HandleAssignDistrict(Params);
     if (CommandType == TEXT("gis_assign_random_districts")) return HandleAssignRandomDistricts(Params);
     if (CommandType == TEXT("gis_generate_buildings"))   return HandleGenerateBuildings(Params);
+    if (CommandType == TEXT("gis_generate_footpaths"))   return HandleGenerateFootpaths(Params);
     if (CommandType == TEXT("gis_generate_procedural_roads")) return HandleGenerateProceduralRoads(Params);
     if (CommandType == TEXT("gis_toggle_block_previews"))     return HandleToggleBlockPreviews(Params);
 
@@ -1906,6 +1907,39 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateBuildings(const TSh
     R->SetBoolField  (TEXT("success"),           true);
     R->SetNumberField(TEXT("blocks_generated"),  Generated);
     R->SetNumberField(TEXT("blocks_skipped"),    Skipped);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_generate_footpaths
+// Params: footpath_preset (string, required — full "/Game/..._C" object path to a
+//         UDynamicRoadDrawPreset Blueprint with no driving lanes, sidewalk-only)
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateFootpaths(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_generate_footpaths: no editor world available"));
+
+    FString PresetPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("footpath_preset"), PresetPath) || PresetPath.IsEmpty())
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_generate_footpaths: missing required 'footpath_preset' param"));
+
+    UClass* PresetClass = LoadClass<UDynamicRoadDrawPreset>(nullptr, *PresetPath);
+    if (!PresetClass)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_footpaths: failed to load UDynamicRoadDrawPreset class at '%s'"), *PresetPath));
+
+    int32 Spawned = 0;
+    FString Error;
+    if (!FCityGenerationUtils::GenerateFootpathsForAllBlocks(World, PresetClass, Spawned, Error))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_footpaths: %s"), *Error));
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),          true);
+    R->SetNumberField(TEXT("footpaths_spawned"), Spawned);
     return R;
 }
 

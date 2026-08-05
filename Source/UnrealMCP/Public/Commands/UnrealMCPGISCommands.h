@@ -68,6 +68,7 @@ private:
     TSharedPtr<FJsonObject> HandleAssignDistrict(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAssignRandomDistricts(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleGenerateBuildings(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleGenerateFootpaths(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleToggleBlockPreviews(const TSharedPtr<FJsonObject>& Params);
 
     // Procedural road network generation (FProceduralRoadGen)

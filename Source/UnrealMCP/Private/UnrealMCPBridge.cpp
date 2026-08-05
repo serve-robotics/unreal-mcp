@@ -1597,6 +1597,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("gis_assign_district") ||
                      CommandType == TEXT("gis_assign_random_districts") ||
                      CommandType == TEXT("gis_generate_buildings") ||
+                     CommandType == TEXT("gis_generate_footpaths") ||
                      CommandType == TEXT("gis_generate_procedural_roads") ||
                      CommandType == TEXT("gis_toggle_block_previews") ||
                      CommandType == TEXT("gis_list_sidewalk_presets") ||
