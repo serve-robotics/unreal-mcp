@@ -85,8 +85,68 @@
 #include "GISViewer/ServeGISRoadImportUtils.h"
 #include "Containers/Ticker.h"
 #include "Settings/EditorLoadingSavingSettings.h"
+#include "UObject/GarbageCollection.h"
+#include "UObject/UObjectGlobals.h"
 
 DEFINE_LOG_CATEGORY(LogUnrealMCP);
+
+namespace
+{
+    /**
+     * True when it is legal to look up UObjects by name.
+     *
+     * Mirrors the exact condition StaticFindAllObjectsFast()/StaticFindFirstObject() assert on
+     * (UObjectGlobals.cpp): inside a package save or a hash-table-locking GC, a name lookup is a
+     * `Fatal` log, not a soft failure. Python is especially exposed — PyGenUtil::ApplyParamDefaults
+     * imports the default value of every object/class-typed parameter on *every* wrapped UFunction
+     * call, so e.g. `actor.get_components_by_class(...)` does a name lookup before it runs a line of
+     * user code. See Docs/Bugs/mcp_python_during_savepackage.md.
+     */
+    bool IsUObjectHashSafe()
+    {
+        return !UE::IsSavingPackage(nullptr) && !IsGarbageCollectingAndLockingUObjectHashTables();
+    }
+
+    /**
+     * Run Work on the game thread, but never nested inside a package save or GC.
+     *
+     * A plain AsyncTask(GameThread, ...) is not enough: a long SavePackage pumps the game-thread
+     * task queue from its own progress UI (FSlowTask::TickProgress -> TickSlate ->
+     * FlushRenderingCommands -> ProcessTasksUntilIdle), so a queued command can execute *inside*
+     * the half-written package. When that happens the command is deferred and re-checked each
+     * engine tick instead — saves and GCs are always transient, and ExecuteCommand's caller-side
+     * poll (300 s) still bounds the wait for the client.
+     */
+    void RunOnGameThreadWhenUObjectSafe(TUniqueFunction<void()>&& InWork)
+    {
+        // TUniqueFunction is move-only; share it so the ticker delegate (which must be copyable)
+        // can hold on to the same work.
+        TSharedPtr<TUniqueFunction<void()>, ESPMode::ThreadSafe> Work =
+            MakeShared<TUniqueFunction<void()>, ESPMode::ThreadSafe>(MoveTemp(InWork));
+
+        AsyncTask(ENamedThreads::GameThread, [Work]()
+        {
+            if (IsUObjectHashSafe())
+            {
+                (*Work)();
+                return;
+            }
+
+            UE_LOG(LogUnrealMCP, Warning,
+                TEXT("Command dispatched during a package save or GC — deferring until UObject lookups are legal"));
+
+            FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Work](float) -> bool
+            {
+                if (!IsInGameThread() || !IsUObjectHashSafe())
+                {
+                    return true;  // keep ticking; re-check next frame
+                }
+                (*Work)();
+                return false;     // done — unregister
+            }), 0.0f);
+        });
+    }
+}
 
 // Default settings
 #define MCP_SERVER_HOST "127.0.0.1"
@@ -1470,8 +1530,9 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
     TPromise<FString> Promise;
     TFuture<FString> Future = Promise.GetFuture();
 
-    // Queue execution on Game Thread
-    AsyncTask(ENamedThreads::GameThread, [this, CommandType, Params, Promise = MoveTemp(Promise)]() mutable
+    // Queue execution on Game Thread — but never inside a package save or GC (see
+    // RunOnGameThreadWhenUObjectSafe; a save's progress UI pumps this very task queue).
+    RunOnGameThreadWhenUObjectSafe([this, CommandType, Params, Promise = MoveTemp(Promise)]() mutable
     {
         TSharedPtr<FJsonObject> ResponseJson = MakeShareable(new FJsonObject);
         
