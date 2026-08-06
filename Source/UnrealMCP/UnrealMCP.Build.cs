@@ -61,7 +61,6 @@ public class UnrealMCP : ModuleRules
 				"Landscape",
 				"RoadBLDRuntime",
 				"LevelEditor",
-				"RenderCore",
 				// Tempo zone graph pipeline
 				"TempoAgentsEditor",
 				"TempoAgents",

@@ -103,12 +103,4 @@ private:
     // implementation's comment for why a function-scoped FScopedDisableValidateOnSave cannot fix
     // the SetEnableStreaming/ValidateOnSave Slate-modal-collision crash.
     TSharedPtr<FJsonObject> HandleSetValidateOnSaveDisabled(const TSharedPtr<FJsonObject>& Params);
-
-    // Synchronous FlushRenderingCommands() at a clean top-level call (wire command:
-    // gis_flush_rendering_commands). Call after a burst of actor destroy/respawn churn (e.g. the
-    // zone graph builder's regenerate-intersection repair loop) and before a heavy save, so any
-    // render resources released by that churn finish draining on their own instead of a save's
-    // own per-package flushes re-entering a still-in-flight one — see the implementation's
-    // comment and Docs/Bugs/save_crash_flushrenderingcommands_beginreleaseresource.md.
-    TSharedPtr<FJsonObject> HandleFlushRenderingCommands(const TSharedPtr<FJsonObject>& Params);
 };
