@@ -22,7 +22,9 @@
 #include "EditorViewportClient.h"
 #include "GameFramework/WorldSettings.h"
 #include "WorldPartition/WorldPartition.h"
+#include "WorldPartition/HLOD/HLODActor.h"
 #include "EditorValidatorSubsystem.h"
+#include "RenderingThread.h"
 
 // ServeLevelGenTools — runtime
 #include "Anchor/ServeGeoAnchor.h"
@@ -142,6 +144,9 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
 
     // Session-scoped validate-on-save disable (see HandleSetValidateOnSaveDisabled)
     if (CommandType == TEXT("gis_set_validate_on_save_disabled")) return HandleSetValidateOnSaveDisabled(Params);
+
+    // Synchronous FlushRenderingCommands() (see HandleFlushRenderingCommands)
+    if (CommandType == TEXT("gis_flush_rendering_commands")) return HandleFlushRenderingCommands(Params);
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
@@ -2359,6 +2364,29 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetWorldPartitionStreaming(
     const bool bWasEnabled = WorldPartition->IsStreamingEnabledInEditor();
     WorldPartition->SetEnableStreaming(bEnableStreaming);
 
+    // With streaming disabled, every LandscapeStreamingProxy (and everything else) stays always-
+    // loaded at full detail — but the level's baked AWorldPartitionHLOD stand-ins (generated from
+    // the Open World template) are NOT correspondingly hidden; HLOD visibility is driven by
+    // streaming-cell load state, which never changes here. The full-detail landscape and its HLOD
+    // proxy then render simultaneously in the same space, Z-fighting. HLODs only exist to stand in
+    // for unloaded-but-still-relevant geometry, which never happens on a permanently-non-streaming
+    // small town — destroy them outright rather than just hiding them (same "delete, don't disable,
+    // what a small town gets no benefit from" reasoning as this function's own streaming toggle).
+    int32 HLODActorsDestroyed = 0;
+    if (!bEnableStreaming)
+    {
+        TArray<AActor*> HLODActorsToDestroy;
+        for (TActorIterator<AWorldPartitionHLOD> It(World); It; ++It)
+        {
+            HLODActorsToDestroy.Add(*It);
+        }
+        for (AActor* HLODActor : HLODActorsToDestroy)
+        {
+            World->DestroyActor(HLODActor);
+            ++HLODActorsDestroyed;
+        }
+    }
+
     ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
     if (LES)
     {
@@ -2369,6 +2397,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetWorldPartitionStreaming(
     R->SetBoolField(TEXT("success"), true);
     R->SetBoolField(TEXT("was_enabled"), bWasEnabled);
     R->SetBoolField(TEXT("enable_streaming"), bEnableStreaming);
+    R->SetNumberField(TEXT("hlod_actors_destroyed"), HLODActorsDestroyed);
     return R;
 }
 
@@ -2511,6 +2540,34 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleDisableExternalActors(const
     R->SetBoolField  (TEXT("success"),          true);
     R->SetNumberField(TEXT("actors_converted"), Converted);
     R->SetBoolField  (TEXT("saved"),            bSaved);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_flush_rendering_commands
+// ---------------------------------------------------------------------------
+//
+// A synchronous FlushRenderingCommands() called at a clean, top-level bridge-command invocation
+// — not nested inside another operation's own async task/modal, unlike the two known crashes
+// documented above (HandleSetWorldPartitionStreaming's validate-on-save race, and
+// gis_save_current_level's own per-package flush burst). Intended call site: right after a burst
+// of actor destroy/respawn churn — e.g. the zone graph builder's regenerate-intersection repair
+// loop — and before any subsequent heavy save. See
+// Docs/Bugs/save_crash_flushrenderingcommands_beginreleaseresource.md: saving a level shortly
+// after that kind of churn re-enters FlushRenderingCommands ("called recursively! 2 calls on the
+// stack") and SIGSEGVs in BeginReleaseResource, consistent with a render resource released by the
+// churn still being drained when the save's own flushes start stacking on top. Draining fully
+// here, on its own, before the save begins, means the save's flushes start from a clean queue
+// instead of interrupting one already in flight. Deliberately NOT paired with CollectGarbage() —
+// gis_save_current_level's own comment already documents a forced GC pass right after
+// gis_create_level reproducibly SIGSEGV'ing in UWorldPartition::BeginDestroy(); this command only
+// does the flush, not a GC pass.
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleFlushRenderingCommands(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    FlushRenderingCommands();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), true);
     return R;
 }
 
