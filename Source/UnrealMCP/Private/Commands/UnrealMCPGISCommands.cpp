@@ -22,6 +22,8 @@
 #include "EditorViewportClient.h"
 #include "GameFramework/WorldSettings.h"
 #include "WorldPartition/WorldPartition.h"
+#include "WorldPartition/HLOD/HLODActor.h"
+#include "EditorValidatorSubsystem.h"
 
 // ServeLevelGenTools — runtime
 #include "Anchor/ServeGeoAnchor.h"
@@ -125,6 +127,23 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     // World Partition streaming toggle
     if (CommandType == TEXT("gis_set_world_partition_streaming")) return HandleSetWorldPartitionStreaming(Params);
 
+    // Merge OFPA external actors back into the main level package
+    if (CommandType == TEXT("gis_disable_external_actors")) return HandleDisableExternalActors(Params);
+
+    // Clear the current level's own landscape spline control-point/segment graph (see
+    // ClearLandscapeSplineGraph below) — needed after gis_conform_landscape_to_roads, whose
+    // RebuildLandscapeSpline() calls leave ALandscapeSplineActor graphs on the CURRENT level that
+    // ClearLandscapeSplineGraph's other call site (HandleCreateLevel) never reaches, since that
+    // one only clears the PREVIOUS level right before switching away from it.
+    if (CommandType == TEXT("gis_clear_landscape_splines")) return HandleClearLandscapeSplines(Params);
+
+    // Plain SaveCurrentLevel() — use instead of Tempo's SaveLevel RPC during/after road
+    // generation (see HandleSaveCurrentLevel for why).
+    if (CommandType == TEXT("gis_save_current_level")) return HandleSaveCurrentLevel(Params);
+
+    // Session-scoped validate-on-save disable (see HandleSetValidateOnSaveDisabled)
+    if (CommandType == TEXT("gis_set_validate_on_save_disabled")) return HandleSetValidateOnSaveDisabled(Params);
+
     return FUnrealMCPCommonUtils::CreateErrorResponse(
         FString::Printf(TEXT("Unknown GIS command: %s"), *CommandType));
 }
@@ -172,6 +191,38 @@ static void ClearLandscapeSplineGraph(UWorld* World)
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// gis_clear_landscape_splines
+// ---------------------------------------------------------------------------
+//
+// Exposes ClearLandscapeSplineGraph for the CURRENT world, not just the level being switched
+// away from. gis_conform_landscape_to_roads' RebuildLandscapeSpline() calls (one per ADynamicRoad)
+// create/populate ALandscapeSplineActor control-point/segment graphs on the level generate_scene.py
+// is actively building — those are never cleared by ClearLandscapeSplineGraph's other call site
+// (HandleCreateLevel), which only clears the PREVIOUS level right before switching away from it.
+// Left uncleared, that graph is exactly the kind of cyclic ControlPoint<->Segment structure whose
+// comment above warns about crashing FArchiveGatherExternalActorRefs during world destruction —
+// confirmed live (2026-07-28): Tempo's own SaveLevel RPC unconditionally calls CollectGarbage()
+// before every save (TempoCoreEditorServiceSubsystem.cpp:127, "Always collect garbage before
+// saving"), and that GC pass reproducibly SIGSEGV'd in UWorldPartition::BeginDestroy()
+// (check(InitState == Uninitialized) failing) on the very first save after road generation, every
+// time, regardless of level-naming/overwrite pattern — pointing at leftover per-session landscape
+// spline state rather than anything specific to how the level was created. Call this after
+// gis_conform_landscape_to_roads and before any save.
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleClearLandscapeSplines(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_clear_landscape_splines: no editor world available"));
+
+    ClearLandscapeSplineGraph(World);
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"), true);
+    R->SetStringField(TEXT("message"), TEXT("Landscape spline graph cleared on current level"));
+    return R;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCreateLevel(const TSharedPtr<FJsonObject>& Params)
@@ -2212,13 +2263,15 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
             TEXT("gis_conform_landscape_to_roads: no editor world"));
     }
 
-    double FalloffMultiplier = 2.5;
-    double HeightOffsetCm    = -25.0;
+    double FalloffMultiplier    = 2.5;
+    double HeightOffsetCm       = -25.0;
+    double EndFalloffMultiplier = 2.0;  // ADynamicRoad's own engine-inherited default
     if (Params.IsValid())
     {
         double V = 0.0;
-        if (Params->TryGetNumberField(TEXT("falloff_multiplier"), V)) FalloffMultiplier = V;
-        if (Params->TryGetNumberField(TEXT("height_offset"),      V)) HeightOffsetCm    = V;
+        if (Params->TryGetNumberField(TEXT("falloff_multiplier"),     V)) FalloffMultiplier    = V;
+        if (Params->TryGetNumberField(TEXT("height_offset"),          V)) HeightOffsetCm       = V;
+        if (Params->TryGetNumberField(TEXT("end_falloff_multiplier"), V)) EndFalloffMultiplier = V;
     }
 
     int32 Conformed = 0;
@@ -2231,6 +2284,16 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
 
         Road->bEnableLandscapeSplineMirroring = true;
         Road->LandscapeFalloffMultiplier      = static_cast<float>(FalloffMultiplier);
+
+        // LandscapeEndFalloffMultiplier controls how far the deformation reaches PAST this
+        // road's own spline endpoint — i.e. into the junction it terminates at (this is the
+        // engine's ULandscapeSplineControlPoint::EndFalloff, "falloff at the start/end of the
+        // spline if this point is a start or end point" — a road's landscape-spline mirror
+        // reaches this control point at both its own ends, which is exactly where roads meet a
+        // junction). FalloffMultiplier above only widens the SIDE falloff (perpendicular to the
+        // road) and never helped junction-apron coverage no matter how far it was widened — this
+        // is the actual lever for that, previously left at its untouched default.
+        Road->LandscapeEndFalloffMultiplier = static_cast<float>(EndFalloffMultiplier);
 
         // Apply per-point height offset so the landscape sits below the road deck
         // rather than co-planar with it, preventing terrain poke-through on hills.
@@ -2259,11 +2322,12 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
     }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetBoolField  (TEXT("success"),           true);
-    R->SetNumberField(TEXT("roads_conformed"),   Conformed);
-    R->SetNumberField(TEXT("roads_no_spline"),   NoSpline);
-    R->SetNumberField(TEXT("falloff_multiplier"), FalloffMultiplier);
-    R->SetNumberField(TEXT("height_offset_cm"),  HeightOffsetCm);
+    R->SetBoolField  (TEXT("success"),               true);
+    R->SetNumberField(TEXT("roads_conformed"),       Conformed);
+    R->SetNumberField(TEXT("roads_no_spline"),       NoSpline);
+    R->SetNumberField(TEXT("falloff_multiplier"),     FalloffMultiplier);
+    R->SetNumberField(TEXT("height_offset_cm"),      HeightOffsetCm);
+    R->SetNumberField(TEXT("end_falloff_multiplier"), EndFalloffMultiplier);
     return R;
 }
 
@@ -2294,8 +2358,43 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetWorldPartitionStreaming(
             TEXT("gis_set_world_partition_streaming: level has no World Partition"));
     }
 
+    // FScopedDisableValidateOnSave suppresses UEditorValidatorSubsystem::ValidateOnSave for this
+    // scope. Without it, SetEnableStreaming's own internal RefreshLoadedState() opens a modal
+    // FSlowTask (pumping a full Slate/engine tick while it runs) and, if an EARLIER save (e.g.
+    // from gis_create_level moments before) already queued ValidateAllSavedPackages as a deferred
+    // FTimerManager delegate, that pending timer can fire mid-tick here and try to open its OWN
+    // modal slow-task nested inside this one — corrupting Slate's window-tracking state and
+    // crashing with SIGSEGV in FSlateWindowHelper::FindWindowByPlatformWindow (confirmed live,
+    // repeatedly, via symbolized crash dumps — see AgentNotes/AgentMemory.md). The SaveCurrentLevel
+    // call right below would also queue a fresh validate-on-save timer for the NEXT call to this
+    // function, so it must stay inside the same guarded scope.
+    FScopedDisableValidateOnSave DisableValidateOnSave;
+
     const bool bWasEnabled = WorldPartition->IsStreamingEnabledInEditor();
     WorldPartition->SetEnableStreaming(bEnableStreaming);
+
+    // With streaming disabled, every LandscapeStreamingProxy (and everything else) stays always-
+    // loaded at full detail — but the level's baked AWorldPartitionHLOD stand-ins (generated from
+    // the Open World template) are NOT correspondingly hidden; HLOD visibility is driven by
+    // streaming-cell load state, which never changes here. The full-detail landscape and its HLOD
+    // proxy then render simultaneously in the same space, Z-fighting. HLODs only exist to stand in
+    // for unloaded-but-still-relevant geometry, which never happens on a permanently-non-streaming
+    // small town — destroy them outright rather than just hiding them (same "delete, don't disable,
+    // what a small town gets no benefit from" reasoning as this function's own streaming toggle).
+    int32 HLODActorsDestroyed = 0;
+    if (!bEnableStreaming)
+    {
+        TArray<AActor*> HLODActorsToDestroy;
+        for (TActorIterator<AWorldPartitionHLOD> It(World); It; ++It)
+        {
+            HLODActorsToDestroy.Add(*It);
+        }
+        for (AActor* HLODActor : HLODActorsToDestroy)
+        {
+            World->DestroyActor(HLODActor);
+            ++HLODActorsDestroyed;
+        }
+    }
 
     ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
     if (LES)
@@ -2307,6 +2406,149 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetWorldPartitionStreaming(
     R->SetBoolField(TEXT("success"), true);
     R->SetBoolField(TEXT("was_enabled"), bWasEnabled);
     R->SetBoolField(TEXT("enable_streaming"), bEnableStreaming);
+    R->SetNumberField(TEXT("hlod_actors_destroyed"), HLODActorsDestroyed);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_save_current_level
+// ---------------------------------------------------------------------------
+//
+// Plain LES->SaveCurrentLevel() — deliberately NOT Tempo's SaveLevel RPC
+// (UTempoCoreEditorServiceSubsystem::SaveLevel), which unconditionally calls
+// CollectGarbage(EObjectFlags::RF_NoFlags) immediately before saving (see
+// TempoCoreEditorServiceSubsystem.cpp:127, "Always collect garbage before saving"). Confirmed
+// live (2026-07-28) that forced GC pass reproducibly SIGSEGVs in UWorldPartition::BeginDestroy()
+// (check(InitState == Uninitialized) failing) on the very first save after generating a road
+// network in a level created via gis_create_level -> NewLevelFromTemplate — even in a freshly
+// launched editor, even after fixing the separate SetEnableStreaming/ValidateOnSave race (see
+// HandleSetValidateOnSaveDisabled above) and clearing landscape splines (see
+// HandleClearLandscapeSplines above), meaning something about the OpenWorld template's own
+// transient WorldPartition object from that duplication is still stale at the time of Tempo's
+// forced GC. This exact plain SaveCurrentLevel() call, with no explicit GC forced first, has
+// saved successfully every single time it's been used this session (see
+// HandleSetWorldPartitionStreaming and HandleDisableExternalActors below) — use it instead of
+// Tempo's tce.save_level() for any save during/after road generation.
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSaveCurrentLevel(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+    ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
+    if (!LES)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_save_current_level: no LevelEditorSubsystem available"));
+
+    const bool bSaved = LES->SaveCurrentLevel();
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), bSaved);
+    R->SetBoolField(TEXT("saved"), bSaved);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_set_validate_on_save_disabled
+// Params: disabled (bool, required)
+// ---------------------------------------------------------------------------
+//
+// A SESSION-SCOPED (not function-scoped) toggle for UEditorValidatorSubsystem's "validate on
+// save". FScopedDisableValidateOnSave (used in HandleSetWorldPartitionStreaming above) does NOT
+// fix the crash it was added for: confirmed live (2026-07-28) via a symbolized crash dump that the
+// actual race runs the OPPOSITE direction from what that fix assumed. UEditorValidatorSubsystem's
+// OWN periodic ValidateAllSavedPackages timer (queued by an earlier, unrelated save, firing on a
+// completely normal FTimerManager::Tick — nothing to do with our bridge command) opens ITS OWN
+// modal FSlowTask FIRST; while that modal's message pump is idling (AddModalWindow ->
+// FlushRenderingCommands -> ProcessTasksUntilIdle), it happens to service OUR pending async
+// HandleSetWorldPartitionStreaming task graph node; THAT function's own SetEnableStreaming call
+// then does a nested Slate tick (RefreshLoadedState -> FSlowTask::TickProgress) while the
+// validation modal is already on screen, and updating its tooltip/cursor state under the OTHER
+// modal corrupts Slate's window tracking (SIGSEGV in FSlateWindowHelper::FindWindowByPlatformWindow).
+// Because ValidateOnSave's ShouldValidateOnSave() check already passed BEFORE our function was
+// ever entered, a guard scoped to our function's lifetime can never prevent it — the disable has
+// to be active for the whole window across which a stray save could queue that timer, i.e. for
+// the whole generate_scene.py run, not one bridge call. Call with disabled=true once at the start
+// of a generation run and disabled=false once at the end (best-effort even on failure).
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetValidateOnSaveDisabled(const TSharedPtr<FJsonObject>& Params)
+{
+    bool bDisabled = false;
+    if (!Params->TryGetBoolField(TEXT("disabled"), bDisabled))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_set_validate_on_save_disabled: 'disabled' (bool) param required."));
+
+    UEditorValidatorSubsystem* ValidatorSubsystem = GEditor ? GEditor->GetEditorSubsystem<UEditorValidatorSubsystem>() : nullptr;
+    if (!ValidatorSubsystem)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_set_validate_on_save_disabled: no UEditorValidatorSubsystem available"));
+
+    if (bDisabled)
+    {
+        ValidatorSubsystem->PushDisableValidateOnSave();
+    }
+    else
+    {
+        ValidatorSubsystem->PopDisableValidateOnSave();
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField(TEXT("success"), true);
+    R->SetBoolField(TEXT("disabled"), bDisabled);
+    return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_disable_external_actors
+// ---------------------------------------------------------------------------
+//
+// A level created via HandleCreateLevel has bUseExternalActors set false immediately after
+// NewLevelFromTemplate — but that only affects actors spawned/saved AFTER that point. Any actor
+// NewLevelFromTemplate already duplicated FROM an OFPA (One File Per Actor) source template is
+// written out as its own external package before our flag ever gets a chance to apply, and setting
+// the level's bUseExternalActors afterward does not retroactively merge those already-external
+// actors back into the main level package.
+//
+// This matters because NewLevelFromTemplate itself unreliably duplicates a template level that has
+// a large number of pre-existing external actor packages (confirmed live: templating from a saved
+// project WorldPartition level with 138 external actor files — 65 landscape proxies' worth — failed
+// with "Packages Failed To Save" / "NewLevelFromTemplate. Failed to save the new level."). Running
+// this command on that level first (merging every external actor back into the main package, so
+// there's nothing left to bulk-duplicate) is the fix: it lets a customized project level serve
+// reliably as a template for future gis_create_level calls.
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleDisableExternalActors(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_disable_external_actors: no editor world"));
+    }
+
+    ULevel* Level = World->GetCurrentLevel();
+    if (!Level)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("gis_disable_external_actors: no current level"));
+    }
+
+    int32 Converted = 0;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        AActor* Actor = *It;
+        if (!IsValid(Actor)) continue;
+        if (Actor->IsPackageExternal())
+        {
+            Actor->SetPackageExternal(false);
+            ++Converted;
+        }
+    }
+
+    Level->bUseExternalActors = false;
+
+    ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
+    bool bSaved = false;
+    if (LES)
+    {
+        bSaved = LES->SaveCurrentLevel();
+    }
+
+    auto R = MakeShared<FJsonObject>();
+    R->SetBoolField  (TEXT("success"),          true);
+    R->SetNumberField(TEXT("actors_converted"), Converted);
+    R->SetBoolField  (TEXT("saved"),            bSaved);
     return R;
 }
 

@@ -83,4 +83,24 @@ private:
 
     // World Partition streaming toggle. Wire command: gis_set_world_partition_streaming
     TSharedPtr<FJsonObject> HandleSetWorldPartitionStreaming(const TSharedPtr<FJsonObject>& Params);
+
+    // Merge every externally-packaged actor (OFPA) in the current level back into the main level
+    // package. Wire command: gis_disable_external_actors. Needed before a level can reliably
+    // serve as a NewLevelFromTemplate source — see HandleCreateLevel's caller notes.
+    TSharedPtr<FJsonObject> HandleDisableExternalActors(const TSharedPtr<FJsonObject>& Params);
+
+    // Plain LES->SaveCurrentLevel() (wire command: gis_save_current_level) — use instead of
+    // Tempo's SaveLevel RPC during/after road generation; see the implementation's comment.
+    TSharedPtr<FJsonObject> HandleSaveCurrentLevel(const TSharedPtr<FJsonObject>& Params);
+
+    // Clear the CURRENT level's landscape spline control-point/segment graph (wire command:
+    // gis_clear_landscape_splines). Call after gis_conform_landscape_to_roads and before any save
+    // — see the implementation's comment for why this is required to avoid a SaveLevel/GC crash.
+    TSharedPtr<FJsonObject> HandleClearLandscapeSplines(const TSharedPtr<FJsonObject>& Params);
+
+    // Session-scoped (not function-scoped) toggle for UEditorValidatorSubsystem's validate-on-save
+    // (wire command: gis_set_validate_on_save_disabled, param: disabled bool). See the
+    // implementation's comment for why a function-scoped FScopedDisableValidateOnSave cannot fix
+    // the SetEnableStreaming/ValidateOnSave Slate-modal-collision crash.
+    TSharedPtr<FJsonObject> HandleSetValidateOnSaveDisabled(const TSharedPtr<FJsonObject>& Params);
 };
