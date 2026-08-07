@@ -2263,13 +2263,15 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
             TEXT("gis_conform_landscape_to_roads: no editor world"));
     }
 
-    double FalloffMultiplier = 2.5;
-    double HeightOffsetCm    = -25.0;
+    double FalloffMultiplier    = 2.5;
+    double HeightOffsetCm       = -25.0;
+    double EndFalloffMultiplier = 2.0;  // ADynamicRoad's own engine-inherited default
     if (Params.IsValid())
     {
         double V = 0.0;
-        if (Params->TryGetNumberField(TEXT("falloff_multiplier"), V)) FalloffMultiplier = V;
-        if (Params->TryGetNumberField(TEXT("height_offset"),      V)) HeightOffsetCm    = V;
+        if (Params->TryGetNumberField(TEXT("falloff_multiplier"),     V)) FalloffMultiplier    = V;
+        if (Params->TryGetNumberField(TEXT("height_offset"),          V)) HeightOffsetCm       = V;
+        if (Params->TryGetNumberField(TEXT("end_falloff_multiplier"), V)) EndFalloffMultiplier = V;
     }
 
     int32 Conformed = 0;
@@ -2282,6 +2284,16 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
 
         Road->bEnableLandscapeSplineMirroring = true;
         Road->LandscapeFalloffMultiplier      = static_cast<float>(FalloffMultiplier);
+
+        // LandscapeEndFalloffMultiplier controls how far the deformation reaches PAST this
+        // road's own spline endpoint — i.e. into the junction it terminates at (this is the
+        // engine's ULandscapeSplineControlPoint::EndFalloff, "falloff at the start/end of the
+        // spline if this point is a start or end point" — a road's landscape-spline mirror
+        // reaches this control point at both its own ends, which is exactly where roads meet a
+        // junction). FalloffMultiplier above only widens the SIDE falloff (perpendicular to the
+        // road) and never helped junction-apron coverage no matter how far it was widened — this
+        // is the actual lever for that, previously left at its untouched default.
+        Road->LandscapeEndFalloffMultiplier = static_cast<float>(EndFalloffMultiplier);
 
         // Apply per-point height offset so the landscape sits below the road deck
         // rather than co-planar with it, preventing terrain poke-through on hills.
@@ -2310,11 +2322,12 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleConformLandscapeToRoads(
     }
 
     auto R = MakeShared<FJsonObject>();
-    R->SetBoolField  (TEXT("success"),           true);
-    R->SetNumberField(TEXT("roads_conformed"),   Conformed);
-    R->SetNumberField(TEXT("roads_no_spline"),   NoSpline);
-    R->SetNumberField(TEXT("falloff_multiplier"), FalloffMultiplier);
-    R->SetNumberField(TEXT("height_offset_cm"),  HeightOffsetCm);
+    R->SetBoolField  (TEXT("success"),               true);
+    R->SetNumberField(TEXT("roads_conformed"),       Conformed);
+    R->SetNumberField(TEXT("roads_no_spline"),       NoSpline);
+    R->SetNumberField(TEXT("falloff_multiplier"),     FalloffMultiplier);
+    R->SetNumberField(TEXT("height_offset_cm"),      HeightOffsetCm);
+    R->SetNumberField(TEXT("end_falloff_multiplier"), EndFalloffMultiplier);
     return R;
 }
 
