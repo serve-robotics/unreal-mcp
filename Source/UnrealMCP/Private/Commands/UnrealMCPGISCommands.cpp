@@ -2508,6 +2508,20 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetValidateOnSaveDisabled(c
 // this command on that level first (merging every external actor back into the main package, so
 // there's nothing left to bulk-duplicate) is the fix: it lets a customized project level serve
 // reliably as a template for future gis_create_level calls.
+//
+// Second use case (2026-08-07): the STOCK ENGINE "/Engine/Maps/Templates/OpenWorld" template
+// (generate_scene.py's default gis_create_level template) has its own pre-existing external
+// Landscape-proxy actors, which NewLevelFromTemplate duplicates INTO the new level's
+// __ExternalActors__ folder while ALSO leaving a full actor entry embedded in the main package —
+// both ends up claiming the same actor GUID. That's only a "Duplicate actor descriptor guid"
+// warning in the editor, but reproducibly SIGSEGVs during cooking
+// (ULevel::GetActorFolder <- FWorldPartitionLevelHelper::LoadActorsInternal <-
+// OnPrepareGeneratorPackageForCook) once the cooker tries to load actors for a streaming cell with
+// an ambiguous/duplicate GUID. Calling this command right after gis_create_level (before anything
+// else touches the new level) converts those template-inherited external actors to embedded ones —
+// but that alone isn't enough: the conversion doesn't touch the OLD external actor package on disk,
+// so without deleting it below, the exact same duplicate-GUID condition (and cook crash) would
+// simply persist. Deleting the stale external packages after the merge is what actually fixes it.
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleDisableExternalActors(const TSharedPtr<FJsonObject>& Params)
 {
     UWorld* World = GetEditorWorld();
@@ -2525,12 +2539,19 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleDisableExternalActors(const
     }
 
     int32 Converted = 0;
+    TArray<FString> StaleExternalPackageNames;
     for (TActorIterator<AActor> It(World); It; ++It)
     {
         AActor* Actor = *It;
         if (!IsValid(Actor)) continue;
         if (Actor->IsPackageExternal())
         {
+            // Capture the external package's long name BEFORE conversion — SetPackageExternal(false)
+            // detaches the actor from it, so it must be recorded up front to delete afterward.
+            if (UPackage* ExternalPackage = Actor->GetExternalPackage())
+            {
+                StaleExternalPackageNames.Add(ExternalPackage->GetName());
+            }
             Actor->SetPackageExternal(false);
             ++Converted;
         }
@@ -2545,10 +2566,25 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleDisableExternalActors(const
         bSaved = LES->SaveCurrentLevel();
     }
 
+    // Delete the now-orphaned external actor packages so they don't linger on disk as stale
+    // duplicates of the actor now embedded in the main package (see comment above the function).
+    int32 DeletedStalePackages = 0;
+    for (const FString& PackageName : StaleExternalPackageNames)
+    {
+        if (UEditorAssetLibrary::DoesAssetExist(PackageName))
+        {
+            if (UEditorAssetLibrary::DeleteAsset(PackageName))
+            {
+                ++DeletedStalePackages;
+            }
+        }
+    }
+
     auto R = MakeShared<FJsonObject>();
-    R->SetBoolField  (TEXT("success"),          true);
-    R->SetNumberField(TEXT("actors_converted"), Converted);
-    R->SetBoolField  (TEXT("saved"),            bSaved);
+    R->SetBoolField  (TEXT("success"),               true);
+    R->SetNumberField(TEXT("actors_converted"),      Converted);
+    R->SetNumberField(TEXT("stale_packages_deleted"), DeletedStalePackages);
+    R->SetBoolField  (TEXT("saved"),                 bSaved);
     return R;
 }
 
