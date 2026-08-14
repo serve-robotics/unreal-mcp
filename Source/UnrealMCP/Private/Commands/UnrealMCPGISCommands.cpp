@@ -45,6 +45,8 @@
 
 #include "Engine/Blueprint.h"
 #include "Settings/EditorLoadingSavingSettings.h"
+#include "RenderingThread.h"   // FlushRenderingCommands
+#include "CoreGlobals.h"       // GIsRunningUnattendedScript
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -66,6 +68,29 @@ static FString SerializeErrorResponse(const FString& Msg)
     FJsonSerializer::Serialize(Resp.ToSharedRef(), W);
     return Out;
 }
+
+// Suppress modal message dialogs for this scope by setting GIsRunningUnattendedScript, which makes
+// FMessageDialog::Open skip the modal path entirely and just log the default result
+// (MessageDialog.cpp:172). Used around level saves: revision control is DISABLED in this project,
+// but FEditorFileUtils::PromptToCheckoutPackages still fails the checkout and fires a hardcoded
+// "Unable to Check Out From Revision Control!" modal (FileHelpers.cpp:2605) on every save, with no
+// opt-out flag of its own. A modal mid-save runs a nested Slate pump — the same re-entrancy class
+// behind the SetEnableStreaming/ValidateOnSave crash documented in HandleSetValidateOnSaveDisabled.
+// Keep scopes tight so unrelated dialogs are not silently auto-answered.
+struct FScopedSuppressModalDialogs
+{
+    FScopedSuppressModalDialogs()
+        : bPrev(GIsRunningUnattendedScript)
+    {
+        GIsRunningUnattendedScript = true;
+    }
+    ~FScopedSuppressModalDialogs()
+    {
+        GIsRunningUnattendedScript = bPrev;
+    }
+private:
+    bool bPrev;
+};
 
 // ---------------------------------------------------------------------------
 
@@ -2399,6 +2424,13 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetWorldPartitionStreaming(
     ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
     if (LES)
     {
+        // Same two hardening measures as HandleSaveCurrentLevel below — see its comment for the
+        // full rationale. They matter here too: the HLOD DestroyActor loop just above frees render
+        // resources immediately before this save, which is exactly the free-then-save pattern that
+        // produced the BeginReleaseResource use-after-free (Occurrence 2), and this save fired the
+        // same checkout modal in the crash session.
+        FlushRenderingCommands();
+        FScopedSuppressModalDialogs SuppressModals;
         LES->SaveCurrentLevel();
     }
 
@@ -2429,11 +2461,44 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSetWorldPartitionStreaming(
 // saved successfully every single time it's been used this session (see
 // HandleSetWorldPartitionStreaming and HandleDisableExternalActors below) — use it instead of
 // Tempo's tce.save_level() for any save during/after road generation.
+//
+// Two hardening measures added 2026-08-12 after the BeginReleaseResource use-after-free recurred
+// with unreal-mcp PR #13's fix already live (see
+// Docs/Bugs/save_crash_flushrenderingcommands_beginreleaseresource.md, "Occurrence 2"):
+//
+//  (1) Drain pending render commands BEFORE the save starts. The crash is a game-thread free of an
+//      FRenderResource whose release was already enqueued to the render thread; the immediately
+//      preceding bridge commands (gis_conform_landscape_to_roads, gis_clear_landscape_splines,
+//      gis_build_zone_graph) tear down spline-mesh/zone-shape render resources 0.45 s before this
+//      save. Flushing here drains those releases at a QUIESCENT point, rather than letting them
+//      land mid-save when SavePackage's own FSlowTask progress UI is re-entering
+//      FlushRenderingCommands ~120x/sec (1973 "called recursively" warnings in the crash session).
+//      This narrows the race window; it is not a proof-carrying fix for it.
+//
+//  (2) Suppress modal message dialogs for the duration of the save. Revision control is DISABLED
+//      in this project, yet FEditorFileUtils::PromptToCheckoutPackages still fails the checkout and
+//      fires FMessageDialog::Open ("Unable to Check Out From Revision Control!",
+//      FileHelpers.cpp:2605) on every single save. That call is a hardcoded engine modal with no
+//      opt-out flag of its own, but FMessageDialog::Open skips the modal path entirely when
+//      GIsRunningUnattendedScript is set (MessageDialog.cpp:172) and just logs the result. A modal
+//      during save runs a nested Slate pump, which is the same re-entrancy class that already
+//      caused the SetEnableStreaming/ValidateOnSave Slate-window-tracking crash documented in
+//      HandleSetValidateOnSaveDisabled below. NOTE: the crash log cannot tell you whether the modal
+//      actually displayed — GWarn logs "Message dialog closed, result: ..." on BOTH the shown and
+//      suppressed paths. In the crash session it resolved in 3 ms with the automation continuing,
+//      so it was almost certainly not blocking on a human. This is defence-in-depth against a
+//      pointless nested pump, not a confirmed contributor to the SIGSEGV.
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleSaveCurrentLevel(const TSharedPtr<FJsonObject>& /*Params*/)
 {
     ULevelEditorSubsystem* LES = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
     if (!LES)
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_save_current_level: no LevelEditorSubsystem available"));
+
+    // (1) Drain enqueued render-resource releases while nothing else is pumping the game thread.
+    FlushRenderingCommands();
+
+    // (2) Suppress the (pointless, revision-control-is-disabled) checkout modal for the save only.
+    FScopedSuppressModalDialogs SuppressModals;
 
     const bool bSaved = LES->SaveCurrentLevel();
 
