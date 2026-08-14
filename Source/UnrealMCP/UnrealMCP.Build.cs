@@ -61,6 +61,7 @@ public class UnrealMCP : ModuleRules
 				"Landscape",
 				"RoadBLDRuntime",
 				"LevelEditor",
+				"RenderCore",         // FlushRenderingCommands before level saves — see HandleSaveCurrentLevel
 				// Tempo zone graph pipeline
 				"TempoAgentsEditor",
 				"TempoAgents",
