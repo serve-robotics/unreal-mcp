@@ -67,6 +67,12 @@ public class UnrealMCP : ModuleRules
 				"TempoAgents",
 				"ZoneGraph",
 				// City block / building generation (FCityGenerationUtils — now in ServeLevelGenToolsEditor)
+				// Roadside prop-line generation (FSplinePropLineGenerationUtils / ASplinePropLine)
+				"VayuSimCityGeneration",
+				// ASplinePropLine itself (UnrealMCPGISCommands.cpp uses it directly) — listed explicitly
+				// rather than relying on VayuSimCityGeneration's public dependency to propagate the
+				// UHT-generated Z_Construct_UClass_ASplinePropLine_NoRegister symbol at link time.
+				"VayuSimCityGenerationRuntime",
 			}
 		);
 

@@ -1,6 +1,8 @@
 #include "Commands/UnrealMCPGISCommands.h"
 #include "Commands/UnrealMCPCommonUtils.h"
 #include "CityGenerationUtils.h"
+#include "SplinePropLineGenerationUtils.h"
+#include "SplinePropLine.h"
 #include "ProceduralRoadGen.h"
 
 #include "Editor.h"
@@ -141,6 +143,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_generate_footpaths"))   return HandleGenerateFootpaths(Params);
     if (CommandType == TEXT("gis_generate_procedural_roads")) return HandleGenerateProceduralRoads(Params);
     if (CommandType == TEXT("gis_toggle_block_previews"))     return HandleToggleBlockPreviews(Params);
+    if (CommandType == TEXT("gis_generate_prop_lines"))       return HandleGeneratePropLines(Params);
 
     // Sidewalk theming
     if (CommandType == TEXT("gis_list_sidewalk_presets")) return HandleListSidewalkPresets(Params);
@@ -2017,6 +2020,85 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateFootpaths(const TSh
     R->SetBoolField  (TEXT("success"),          true);
     R->SetNumberField(TEXT("footpaths_spawned"), Spawned);
     return R;
+}
+
+// ---------------------------------------------------------------------------
+// gis_generate_prop_lines
+// Params:
+//   prop_line_classes (array of strings, required — full "/Game/..._C" object paths to
+//     ASplinePropLine Blueprints, e.g. BP_SplineTrees, BP_SplineShrubs_Unkempt. Every class in the
+//     array is layered along each matching edge in a single call.)
+//   edge_source (string, optional, default "sidewalk"): "sidewalk" = each sidewalk's outer
+//     (property-line) edge, skipping sides with no sidewalk; "road" = the road's own edge curve
+//     (ignores sidewalks — use for roads without one, or curb-line placement).
+//   side (string, optional, default "both"): "left", "right", or "both".
+//   reverse_direction (bool, optional, default false): flip each prop line's direction of travel
+//     (start/end swapped, tangents mirrored) — for asymmetric meshes that need to face a
+//     particular way relative to the road.
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGeneratePropLines(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_generate_prop_lines: no editor world available"));
+
+    const TArray<TSharedPtr<FJsonValue>>* ClassPathsJson = nullptr;
+    if (!Params.IsValid() || !Params->TryGetArrayField(TEXT("prop_line_classes"), ClassPathsJson) || !ClassPathsJson || ClassPathsJson->IsEmpty())
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_generate_prop_lines: missing required 'prop_line_classes' array param"));
+
+    TArray<TSubclassOf<ASplinePropLine>> PropLineClasses;
+    for (const TSharedPtr<FJsonValue>& Value : *ClassPathsJson)
+    {
+        FString ClassPath;
+        if (!Value.IsValid() || !Value->TryGetString(ClassPath) || ClassPath.IsEmpty())
+            continue;
+
+        UClass* PropLineClass = LoadClass<ASplinePropLine>(nullptr, *ClassPath);
+        if (!PropLineClass)
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("gis_generate_prop_lines: failed to load ASplinePropLine class at '%s'"), *ClassPath));
+
+        PropLineClasses.Add(PropLineClass);
+    }
+
+    FString EdgeSourceStr = TEXT("sidewalk");
+    Params->TryGetStringField(TEXT("edge_source"), EdgeSourceStr);
+    ESplinePropLineEdgeSource EdgeSource;
+    if (EdgeSourceStr.Equals(TEXT("road"), ESearchCase::IgnoreCase))
+        EdgeSource = ESplinePropLineEdgeSource::RoadEdge;
+    else if (EdgeSourceStr.Equals(TEXT("sidewalk"), ESearchCase::IgnoreCase))
+        EdgeSource = ESplinePropLineEdgeSource::SidewalkOuterEdge;
+    else
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_prop_lines: invalid 'edge_source' value '%s' (expected 'sidewalk' or 'road')"), *EdgeSourceStr));
+
+    FString SideStr = TEXT("both");
+    Params->TryGetStringField(TEXT("side"), SideStr);
+    ESplinePropLineSide Side;
+    if (SideStr.Equals(TEXT("left"), ESearchCase::IgnoreCase))
+        Side = ESplinePropLineSide::Left;
+    else if (SideStr.Equals(TEXT("right"), ESearchCase::IgnoreCase))
+        Side = ESplinePropLineSide::Right;
+    else if (SideStr.Equals(TEXT("both"), ESearchCase::IgnoreCase))
+        Side = ESplinePropLineSide::Both;
+    else
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_prop_lines: invalid 'side' value '%s' (expected 'left', 'right', or 'both')"), *SideStr));
+
+    bool bReverseDirection = false;
+    Params->TryGetBoolField(TEXT("reverse_direction"), bReverseDirection);
+
+    int32 Spawned = 0;
+    FString Error;
+    if (!FSplinePropLineGenerationUtils::GeneratePropLinesAlongRoads(World, PropLineClasses, EdgeSource, Side, bReverseDirection, Spawned, Error))
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_prop_lines: %s"), *Error));
+
+    auto R2 = MakeShared<FJsonObject>();
+    R2->SetBoolField  (TEXT("success"),        true);
+    R2->SetNumberField(TEXT("prop_lines_spawned"), Spawned);
+    return R2;
 }
 
 // ---------------------------------------------------------------------------

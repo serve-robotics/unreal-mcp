@@ -71,6 +71,9 @@ private:
     TSharedPtr<FJsonObject> HandleGenerateFootpaths(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleToggleBlockPreviews(const TSharedPtr<FJsonObject>& Params);
 
+    // Roadside prop-line generation (FSplinePropLineGenerationUtils)
+    TSharedPtr<FJsonObject> HandleGeneratePropLines(const TSharedPtr<FJsonObject>& Params);
+
     // Procedural road network generation (FProceduralRoadGen)
     TSharedPtr<FJsonObject> HandleGenerateProceduralRoads(const TSharedPtr<FJsonObject>& Params);
 
