@@ -2030,12 +2030,21 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateFootpaths(const TSh
 //     ASplinePropLine Blueprints, e.g. BP_SplineTrees, BP_SplineShrubs_Unkempt. Every class in the
 //     array is layered along each matching edge in a single call.)
 //   edge_source (string, optional, default "sidewalk"): "sidewalk" = each sidewalk's outer
-//     (property-line) edge, skipping sides with no sidewalk; "road" = the road's own edge curve
-//     (ignores sidewalks — use for roads without one, or curb-line placement).
+//     (property-line) edge, skipping sides with no sidewalk; "sidewalk_inner" = the sidewalk's
+//     curb-side edge, also skipping sides with no sidewalk; "road" = the road's own edge curve
+//     (same geometry as "sidewalk_inner" but does NOT require a sidewalk — use for roads without
+//     one, or curb-line placement).
 //   side (string, optional, default "both"): "left", "right", or "both".
 //   reverse_direction (bool, optional, default false): flip each prop line's direction of travel
 //     (start/end swapped, tangents mirrored) — for asymmetric meshes that need to face a
-//     particular way relative to the road.
+//     particular way relative to the road. Reversing the LEFT side (and not the right) is what puts
+//     the road on a prop line's left along its direction of travel on both sides of a street.
+//   road_names (array of strings, optional): restrict placement to roads whose ADynamicRoad actor
+//     label appears here. Omitted or empty = every road. Lets the caller own the "which roads get
+//     one" decision (e.g. a seeded per-road chance) rather than this command owning an RNG.
+//   outward_offset (float, optional, default 0.0): lateral shift in cm applied to the traced edge
+//     before building, positive = AWAY from the road, negative = toward it. Signed per side
+//     internally, so one positive value means "outward" on both sides.
 // ---------------------------------------------------------------------------
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGeneratePropLines(const TSharedPtr<FJsonObject>& Params)
@@ -2070,9 +2079,11 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGeneratePropLines(const TSh
         EdgeSource = ESplinePropLineEdgeSource::RoadEdge;
     else if (EdgeSourceStr.Equals(TEXT("sidewalk"), ESearchCase::IgnoreCase))
         EdgeSource = ESplinePropLineEdgeSource::SidewalkOuterEdge;
+    else if (EdgeSourceStr.Equals(TEXT("sidewalk_inner"), ESearchCase::IgnoreCase))
+        EdgeSource = ESplinePropLineEdgeSource::SidewalkInnerEdge;
     else
         return FUnrealMCPCommonUtils::CreateErrorResponse(
-            FString::Printf(TEXT("gis_generate_prop_lines: invalid 'edge_source' value '%s' (expected 'sidewalk' or 'road')"), *EdgeSourceStr));
+            FString::Printf(TEXT("gis_generate_prop_lines: invalid 'edge_source' value '%s' (expected 'sidewalk', 'sidewalk_inner' or 'road')"), *EdgeSourceStr));
 
     FString SideStr = TEXT("both");
     Params->TryGetStringField(TEXT("side"), SideStr);
@@ -2090,9 +2101,26 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGeneratePropLines(const TSh
     bool bReverseDirection = false;
     Params->TryGetBoolField(TEXT("reverse_direction"), bReverseDirection);
 
+    TArray<FString> RoadNames;
+    const TArray<TSharedPtr<FJsonValue>>* RoadNamesJson = nullptr;
+    if (Params->TryGetArrayField(TEXT("road_names"), RoadNamesJson) && RoadNamesJson)
+    {
+        for (const TSharedPtr<FJsonValue>& Value : *RoadNamesJson)
+        {
+            FString RoadName;
+            if (Value.IsValid() && Value->TryGetString(RoadName) && !RoadName.IsEmpty())
+                RoadNames.Add(RoadName);
+        }
+    }
+
+    double OutwardOffset = 0.0;
+    Params->TryGetNumberField(TEXT("outward_offset"), OutwardOffset);
+
     int32 Spawned = 0;
     FString Error;
-    if (!FSplinePropLineGenerationUtils::GeneratePropLinesAlongRoads(World, PropLineClasses, EdgeSource, Side, bReverseDirection, Spawned, Error))
+    if (!FSplinePropLineGenerationUtils::GeneratePropLinesAlongRoads(
+            World, PropLineClasses, EdgeSource, Side, bReverseDirection, RoadNames,
+            static_cast<float>(OutwardOffset), Spawned, Error))
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             FString::Printf(TEXT("gis_generate_prop_lines: %s"), *Error));
 
