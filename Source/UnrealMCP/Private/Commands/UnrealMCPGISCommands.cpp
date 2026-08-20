@@ -144,6 +144,7 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleCommand(
     if (CommandType == TEXT("gis_generate_procedural_roads")) return HandleGenerateProceduralRoads(Params);
     if (CommandType == TEXT("gis_toggle_block_previews"))     return HandleToggleBlockPreviews(Params);
     if (CommandType == TEXT("gis_generate_prop_lines"))       return HandleGeneratePropLines(Params);
+    if (CommandType == TEXT("gis_generate_perimeter_fences")) return HandleGeneratePerimeterFences(Params);
 
     // Sidewalk theming
     if (CommandType == TEXT("gis_list_sidewalk_presets")) return HandleListSidewalkPresets(Params);
@@ -2099,6 +2100,54 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGeneratePropLines(const TSh
     R2->SetBoolField  (TEXT("success"),        true);
     R2->SetNumberField(TEXT("prop_lines_spawned"), Spawned);
     return R2;
+}
+
+// ---------------------------------------------------------------------------
+// gis_generate_perimeter_fences
+// Params:
+//   source (string, optional, default "parcel"): "parcel" = every UCityParcel whose LandUseClass
+//     CDO has a FenceClass set (e.g. LandUse_VacantLot), traced from Parcel->ShapePoints; "district"
+//     = every ACityBlock whose DistrictClass CDO has a FenceClass set (e.g. District_Park), traced
+//     from Block->OuterLoop.
+//   offset (float, optional, default 0.0): perimeter offset in cm, positive = outward/inflate,
+//     negative = inward/inset (see UClipperUtils::OffsetPolygon3D).
+// Does NOT clear fences spawned by a previous call — matches gis_generate_prop_lines's own current
+// non-idempotency (re-running duplicates actors).
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGeneratePerimeterFences(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GetEditorWorld();
+    if (!World)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("gis_generate_perimeter_fences: no editor world available"));
+
+    FString SourceStr = TEXT("parcel");
+    if (Params.IsValid())
+        Params->TryGetStringField(TEXT("source"), SourceStr);
+
+    double Offset = 0.0;
+    if (Params.IsValid())
+        Params->TryGetNumberField(TEXT("offset"), Offset);
+
+    int32 Spawned = 0;
+    FString Error;
+    bool bSuccess;
+    if (SourceStr.Equals(TEXT("parcel"), ESearchCase::IgnoreCase))
+        bSuccess = FSplinePropLineGenerationUtils::PlacePropLinesOnParcelPerimeters(World, static_cast<float>(Offset), Spawned, Error);
+    else if (SourceStr.Equals(TEXT("district"), ESearchCase::IgnoreCase))
+        bSuccess = FSplinePropLineGenerationUtils::PlacePropLinesOnDistrictPerimeters(World, static_cast<float>(Offset), Spawned, Error);
+    else
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_perimeter_fences: invalid 'source' value '%s' (expected 'parcel' or 'district')"), *SourceStr));
+
+    if (!bSuccess)
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("gis_generate_perimeter_fences: %s"), *Error));
+
+    auto R3 = MakeShared<FJsonObject>();
+    R3->SetBoolField  (TEXT("success"),        true);
+    R3->SetNumberField(TEXT("fences_spawned"), Spawned);
+    return R3;
 }
 
 // ---------------------------------------------------------------------------

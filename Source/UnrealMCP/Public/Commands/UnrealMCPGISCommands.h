@@ -74,6 +74,9 @@ private:
     // Roadside prop-line generation (FSplinePropLineGenerationUtils)
     TSharedPtr<FJsonObject> HandleGeneratePropLines(const TSharedPtr<FJsonObject>& Params);
 
+    // Parcel/district perimeter fence generation (FSplinePropLineGenerationUtils)
+    TSharedPtr<FJsonObject> HandleGeneratePerimeterFences(const TSharedPtr<FJsonObject>& Params);
+
     // Procedural road network generation (FProceduralRoadGen)
     TSharedPtr<FJsonObject> HandleGenerateProceduralRoads(const TSharedPtr<FJsonObject>& Params);
 
