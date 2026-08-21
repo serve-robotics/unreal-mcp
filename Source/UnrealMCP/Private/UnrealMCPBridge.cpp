@@ -1572,8 +1572,34 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
 
             if (CommandType == TEXT("ping"))
             {
+                // ping answers "is the bridge up?" AND "is it usable right now?" in one call.
+                // In PIE, most editor-scripting calls fail while ping still returned a bare
+                // "pong", so a healthy-looking ping was actively misleading — agents burned
+                // whole debugging detours rediscovering play state (2026-08-21). It is the
+                // mandatory first call of every session, so piggybacking the state here is free.
                 ResultJson = MakeShareable(new FJsonObject);
                 ResultJson->SetStringField(TEXT("message"), TEXT("pong"));
+
+                const bool bInPIE = GEditor && GEditor->PlayWorld != nullptr;
+                const bool bSimulating = GEditor && GEditor->bIsSimulatingInEditor;
+                ResultJson->SetStringField(TEXT("mode"),
+                    bSimulating ? TEXT("simulate") : (bInPIE ? TEXT("pie") : TEXT("editor")));
+                // Editor-scripting calls (actor mutation, level save) are only reliable here.
+                ResultJson->SetBoolField(TEXT("scripting_ok"), !bInPIE && !bSimulating);
+
+                if (UWorld* EditorWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr)
+                {
+                    ResultJson->SetStringField(TEXT("level"), EditorWorld->GetName());
+                }
+
+                // Selection count: lets "act on the selection" scripts sanity-check before running.
+                if (GEditor)
+                {
+                    if (USelection* Selected = GEditor->GetSelectedActors())
+                    {
+                        ResultJson->SetNumberField(TEXT("selected_actors"), Selected->Num());
+                    }
+                }
             }
             // Editor Commands (including actor manipulation)
             else if (CommandType == TEXT("get_actors_in_level") ||
