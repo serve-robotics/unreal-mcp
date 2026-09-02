@@ -2045,6 +2045,13 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGenerateFootpaths(const TSh
 //   outward_offset (float, optional, default 0.0): lateral shift in cm applied to the traced edge
 //     before building, positive = AWAY from the road, negative = toward it. Signed per side
 //     internally, so one positive value means "outward" on both sides.
+//   spacing_range_cm (number OR [min, max] array, optional): distance in cm between placement
+//     points along each spawned line — i.e. how DENSE the props are. A bare number means even
+//     spacing; a 2-element array randomizes per step within [min, max] using the line's own Seed.
+//     Overrides ASplinePropLine::SpacingRange on each spawned instance. Omitted = each class keeps
+//     its Blueprint default (BP_SplineTrees et al. ship 300cm, which reads as very dense for trees).
+//     Values must be > 0. Per-pool-entry FSplinePropPoolEntry::Spacing still wins where an entry
+//     declares one — this only replaces the line's shared fallback.
 // ---------------------------------------------------------------------------
 
 TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGeneratePropLines(const TSharedPtr<FJsonObject>& Params)
@@ -2116,11 +2123,47 @@ TSharedPtr<FJsonObject> FUnrealMCPGISCommands::HandleGeneratePropLines(const TSh
     double OutwardOffset = 0.0;
     Params->TryGetNumberField(TEXT("outward_offset"), OutwardOffset);
 
+    // Optional [min, max] cm between placement points. Omitted = each class keeps its own Blueprint
+    // SpacingRange default, i.e. exactly the previous behavior. A single number is accepted as an
+    // even spacing (min == max), since that is the common case and [n, n] is noise to write.
+    TOptional<FVector2D> SpacingRangeOverride;
+    const TArray<TSharedPtr<FJsonValue>>* SpacingJson = nullptr;
+    double SpacingScalar = 0.0;
+    if (Params->TryGetArrayField(TEXT("spacing_range_cm"), SpacingJson) && SpacingJson)
+    {
+        if (SpacingJson->Num() != 2)
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("gis_generate_prop_lines: 'spacing_range_cm' array must have exactly 2 elements [min, max], got %d"), SpacingJson->Num()));
+
+        double SpacingMin = 0.0, SpacingMax = 0.0;
+        if (!(*SpacingJson)[0]->TryGetNumber(SpacingMin) || !(*SpacingJson)[1]->TryGetNumber(SpacingMax))
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                TEXT("gis_generate_prop_lines: 'spacing_range_cm' elements must both be numbers"));
+
+        if (SpacingMin <= 0.0 || SpacingMax <= 0.0)
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("gis_generate_prop_lines: 'spacing_range_cm' values must be > 0 (got [%g, %g]) — a zero/negative spacing would place props until the internal safety cap"), SpacingMin, SpacingMax));
+
+        if (SpacingMax < SpacingMin)
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("gis_generate_prop_lines: 'spacing_range_cm' max (%g) is less than min (%g)"), SpacingMax, SpacingMin));
+
+        SpacingRangeOverride = FVector2D(SpacingMin, SpacingMax);
+    }
+    else if (Params->TryGetNumberField(TEXT("spacing_range_cm"), SpacingScalar))
+    {
+        if (SpacingScalar <= 0.0)
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("gis_generate_prop_lines: 'spacing_range_cm' must be > 0 (got %g)"), SpacingScalar));
+
+        SpacingRangeOverride = FVector2D(SpacingScalar, SpacingScalar);
+    }
+
     int32 Spawned = 0;
     FString Error;
     if (!FSplinePropLineGenerationUtils::GeneratePropLinesAlongRoads(
             World, PropLineClasses, EdgeSource, Side, bReverseDirection, RoadNames,
-            static_cast<float>(OutwardOffset), Spawned, Error))
+            static_cast<float>(OutwardOffset), Spawned, Error, SpacingRangeOverride))
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             FString::Printf(TEXT("gis_generate_prop_lines: %s"), *Error));
 
