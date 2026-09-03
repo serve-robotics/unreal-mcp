@@ -115,4 +115,10 @@ private:
 	FTSTicker::FDelegateHandle WatchdogTickerHandle;
 	int32 WatchdogLastRoadGeoCount = -1;
 	int32 WatchdogStableChecks     = 0;
+
+	// Bracket FlushRenderingCommands so dispatched commands are never executed from inside a
+	// re-entrant game-thread pump (where a sync asset load can be Fatal). See IsAssetLoadSafe()
+	// in the .cpp for the full mechanism and the alternatives that don't work.
+	FDelegateHandle FlushStartHandle;
+	FDelegateHandle FlushEndHandle;
 };

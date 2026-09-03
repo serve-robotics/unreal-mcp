@@ -22,6 +22,7 @@
 #include "Engine/Selection.h"
 #include "Kismet/GameplayStatics.h"
 #include "Async/Async.h"
+#include "RenderingThread.h"   // FCoreRenderDelegates flush hooks (see IsAssetLoadSafe)
 // Add Blueprint related includes
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
@@ -108,14 +109,84 @@ namespace
     }
 
     /**
-     * Run Work on the game thread, but never nested inside a package save or GC.
+     * Depth of FlushRenderingCommands calls currently on the stack (game thread only, so a plain
+     * int32 needs no atomics). Maintained by the delegates hooked in
+     * UUnrealMCPBridge::Initialize.
+     */
+    int32 GRenderFlushDepth = 0;
+
+    /**
+     * True when a dispatched command may safely run a synchronous asset load.
+     *
+     * The danger is being executed *re-entrantly* from inside an engine critical section that
+     * pumps the game-thread task queue while it waits. The texture-compilation case:
+     *
+     *   FEngineLoop::Tick
+     *     FAssetCompilingManager::ProcessAsyncTasks
+     *       FTextureCompilingManager::ProcessTextures
+     *         FTextureCompilingManager::PostCompilation   <- sets bIsRoutingPostCompilation=true
+     *           UTexture2D::UpdateResourceWithParams         (TGuardValue, held for whole body)
+     *             UStreamableRenderAsset::WaitForPendingInitOrStreaming
+     *               FlushRenderingCommands -> FFrameEndSync::Sync
+     *                 FTaskGraphInterface::ProcessThreadUntilIdle(GameThread)  <- pumps OUR task
+     *                   ... our AsyncTask runs here, inside the guard ...
+     *
+     * If the command we run then loads a package (e.g. Python `unreal.load_class`),
+     * FlushAsyncLoading runs some other texture's UTexture::PostLoad -> UpdateResource ->
+     * FTextureCompilingManager::AddTextures, which sees the guard still set and hits a Fatal:
+     *   "Registering a texture to the compile manager from inside a texture postcompilation
+     *    is not supported" (TextureCompiler.cpp:327)
+     *
+     * We detect it via FCoreRenderDelegates::OnFlushRenderingCommandsStart/End, which bracket
+     * FlushRenderingCommands (RenderingThread.cpp:1281/1313) — i.e. exactly the window in which
+     * the game-thread queue may be pumped re-entrantly. While a flush is in flight we defer.
+     *
+     * Two rejected alternatives, so nobody re-treads them:
+     *   - bIsRoutingPostCompilation (the actual guard) is private with no accessor.
+     *   - FAssetCompilingManager::OnPackageScopeEvent only fires from
+     *     ActorDeferredScriptManager (construction scripts), NOT from texture compilation, so a
+     *     counter driven by it never rises during this crash and the guard is inert.
+     *   - FTaskGraphInterface::IsThreadProcessingTasks(GameThread) looks tempting but is TRUE for
+     *     every normal game-thread task too (the queue's RecursionGuard is set by the ordinary
+     *     ProcessTasksUntilIdle loop), so gating on it defers every command forever.
+     *
+     * This covers every re-entrant pump that goes through a render flush — texture compilation,
+     * SavePackage's slow-task UI, viewport resize — not just the one case that crashed.
+     *
+     * Same shape of bug as the SavePackage one IsUObjectHashSafe() guards against (see
+     * Docs/Bugs/save_crash_flushrenderingcommands_beginreleaseresource.md and unreal-mcp PR #13):
+     * a long engine operation pumping the game-thread task queue from inside its own critical
+     * section.
+     *
+     * NOTE: the engine's comment at that assert blames a DDC-key change from a missing
+     * PreEditChange. That is NOT what happens here — the post-compiling texture and the
+     * re-entrant one are unrelated assets with unrelated DDC keys. Don't go looking for a
+     * texture with a mutating property; the trigger is purely re-entrancy.
+     */
+    bool IsAssetLoadSafe()
+    {
+        return GRenderFlushDepth == 0;
+    }
+
+    /** True when a dispatched command is safe to run at all (UObject hash + asset loading). */
+    bool IsCommandDispatchSafe()
+    {
+        return IsUObjectHashSafe() && IsAssetLoadSafe();
+    }
+
+    /**
+     * Run Work on the game thread, but never nested inside a package save, a GC, or a
+     * rendering-command flush.
      *
      * A plain AsyncTask(GameThread, ...) is not enough: a long SavePackage pumps the game-thread
      * task queue from its own progress UI (FSlowTask::TickProgress -> TickSlate ->
      * FlushRenderingCommands -> ProcessTasksUntilIdle), so a queued command can execute *inside*
-     * the half-written package. When that happens the command is deferred and re-checked each
-     * engine tick instead — saves and GCs are always transient, and ExecuteCommand's caller-side
-     * poll (300 s) still bounds the wait for the client.
+     * the half-written package. Texture compilation does the same thing by a different route
+     * (PostCompilation -> UpdateResource -> FlushRenderingCommands -> ProcessThreadUntilIdle),
+     * where a sync load from the pumped command is Fatal — see IsAssetLoadSafe(). When either
+     * window is open the command is deferred and re-checked each engine tick instead — saves,
+     * GCs and render flushes are all transient, and ExecuteCommand's caller-side poll (300 s)
+     * still bounds the wait for the client.
      */
     void RunOnGameThreadWhenUObjectSafe(TUniqueFunction<void()>&& InWork)
     {
@@ -126,18 +197,20 @@ namespace
 
         AsyncTask(ENamedThreads::GameThread, [Work]()
         {
-            if (IsUObjectHashSafe())
+            if (IsCommandDispatchSafe())
             {
                 (*Work)();
                 return;
             }
 
             UE_LOG(LogUnrealMCP, Warning,
-                TEXT("Command dispatched during a package save or GC — deferring until UObject lookups are legal"));
+                TEXT("Command dispatched during a package save, GC, or render-command flush "
+                     "(save/GC safe=%d, asset-load safe=%d) — deferring until it is legal to run"),
+                IsUObjectHashSafe() ? 1 : 0, IsAssetLoadSafe() ? 1 : 0);
 
             FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Work](float) -> bool
             {
-                if (!IsInGameThread() || !IsUObjectHashSafe())
+                if (!IsInGameThread() || !IsCommandDispatchSafe())
                 {
                     return true;  // keep ticking; re-check next frame
                 }
@@ -204,6 +277,24 @@ void UUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
         FTickerDelegate::CreateUObject(this, &UUnrealMCPBridge::WatchdogTickRoadRebuild),
         2.0f);
     UE_LOG(LogUnrealMCP, Display, TEXT("UnrealMCPBridge: autosave watchdog started"));
+
+    // Track render-flush depth so a dispatched command is never run from inside
+    // FlushRenderingCommands — where the game-thread queue gets pumped re-entrantly and a
+    // synchronous asset load can be Fatal (TextureCompiler.cpp:327). See IsAssetLoadSafe().
+    FlushStartHandle = FCoreRenderDelegates::OnFlushRenderingCommandsStart.AddLambda([]()
+    {
+        if (IsInGameThread())
+        {
+            ++GRenderFlushDepth;
+        }
+    });
+    FlushEndHandle = FCoreRenderDelegates::OnFlushRenderingCommandsEnd.AddLambda([]()
+    {
+        if (IsInGameThread() && GRenderFlushDepth > 0)
+        {
+            --GRenderFlushDepth;
+        }
+    });
 }
 
 // Clean up resources when subsystem is destroyed
@@ -220,6 +311,17 @@ void UUnrealMCPBridge::Deinitialize()
         FTSTicker::GetCoreTicker().RemoveTicker(WatchdogTickerHandle);
         WatchdogTickerHandle.Reset();
     }
+    if (FlushStartHandle.IsValid())
+    {
+        FCoreRenderDelegates::OnFlushRenderingCommandsStart.Remove(FlushStartHandle);
+        FlushStartHandle.Reset();
+    }
+    if (FlushEndHandle.IsValid())
+    {
+        FCoreRenderDelegates::OnFlushRenderingCommandsEnd.Remove(FlushEndHandle);
+        FlushEndHandle.Reset();
+    }
+    GRenderFlushDepth = 0;
     StopServer();
 }
 
